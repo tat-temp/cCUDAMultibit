@@ -13,9 +13,10 @@
 #   make GPU_ARCH=120
 # nvcc's host compiler defaults to g++ on Linux (override: make HOSTCXX=g++-13).
 #
-# Tuning knob (occupancy vs register spills, see DEVELOPMENT_PLAN.md matrix):
-#   make MINBLOCKS=1|2|3     # __launch_bounds__(256,N); default 1. `make gate` tracks the ceiling.
-#   A/B on-device:  make clean && make MINBLOCKS=2 && ./mbcrack --benchmark   (clean: obj is cached)
+# Tuning knobs (occupancy vs register spills, see DEVELOPMENT_PLAN.md matrix):
+#   make MINBLOCKS=1|2|3     # __launch_bounds__ minBlocksPerMP; default 1. `make gate` tracks the ceiling.
+#   make THREADS=256|512     # block size; 512 = hashcat's config (forces 128-reg cap -> spills).
+#   A/B on-device:  make clean && make THREADS=512 && ./mbcrack --benchmark   (clean: obj is cached)
 
 TARGET      := mbcrack
 CPU_TARGET  := mbcrack_cpu
@@ -46,12 +47,14 @@ SM_ARCHS   := $(strip $(BASE_ARCHS) $(filter-out $(BASE_ARCHS),$(GPU_ARCH)))
 GENCODE    := $(foreach a,$(SM_ARCHS),-gencode arch=compute_$(a),code=sm_$(a))
 NATIVE_GENCODE := -gencode arch=compute_$(GPU_ARCH),code=sm_$(GPU_ARCH)
 
-# __launch_bounds__(256, MINBLOCKS) — the occupancy/register knob (see the tuning matrix in
-# DEVELOPMENT_PLAN.md). 1 = default (no spills, fastest on RTX 5090), 2 = spills/more occupancy,
-# 3 = heavy spills. Changing it needs a rebuild: make clean && make MINBLOCKS=2 && ./mbcrack --benchmark
+# __launch_bounds__(THREADS, MINBLOCKS) — the occupancy/register knobs (see the tuning matrix in
+# DEVELOPMENT_PLAN.md). MINBLOCKS 1 = default (no spills, fastest on RTX 5090), 2/3 = more occupancy but
+# spills. THREADS = block size (256 default; 512 matches hashcat's config but forces the 128-reg cap ->
+# spills). Changing either needs a rebuild: make clean && make THREADS=512 && ./mbcrack --benchmark
 MINBLOCKS  ?= 1
+THREADS    ?= 256
 
-NVCC_FLAGS := -O3 -use_fast_math --ptxas-options=-O3 $(GENCODE) -DUSE_CUDA -DMB_MINBLOCKS=$(MINBLOCKS) -Isrc
+NVCC_FLAGS := -O3 -use_fast_math --ptxas-options=-O3 $(GENCODE) -DUSE_CUDA -DMB_MINBLOCKS=$(MINBLOCKS) -DMB_THREADS=$(THREADS) -Isrc
 CXXFLAGS   := -std=c++17 -Xcompiler -pthread -ccbin $(HOSTCXX)
 LDFLAGS    := -cudart=static -Xcompiler -pthread
 
@@ -91,10 +94,11 @@ test: selftest gen_vector
 
 # ---- codegen inspection (no effect on the shipped binary) ----
 HOT_KERNEL  := crack_kernel
-REG_CEILING := $(shell echo $$((256 / $(MINBLOCKS))))   # 65536/(256*MINBLOCKS): tracks MINBLOCKS
+REG_CEILING := $(shell echo $$((65536 / ($(THREADS) * $(MINBLOCKS)))))   # tracks THREADS and MINBLOCKS
 GATE_LOG    := ptxas-gate.log
 PTXAS_V_BUILD = $(NVCC) -O3 -use_fast_math --ptxas-options=-O3 $(NATIVE_GENCODE) $(CXXFLAGS) \
-                -DUSE_CUDA -DMB_MINBLOCKS=$(MINBLOCKS) -Isrc -Xptxas -v -c $(SRC_DEV) -o kernel-ptxinfo.o
+                -DUSE_CUDA -DMB_MINBLOCKS=$(MINBLOCKS) -DMB_THREADS=$(THREADS) -Isrc \
+                -Xptxas -v -c $(SRC_DEV) -o kernel-ptxinfo.o
 
 ptxinfo: $(SRC_DEV) $(HDRS)
 	$(PTXAS_V_BUILD)

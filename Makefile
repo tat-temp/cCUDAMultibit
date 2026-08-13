@@ -52,9 +52,13 @@ CPUFLAGS    := -O3 -std=c++17 -Isrc -pthread
 
 .PHONY: all cpu test gate ptxinfo sass resusage tools clean
 
-tools: gen_vector
+# Default goal is the GPU cracker. Set explicitly so it can't be hijacked by target
+# ordering (e.g. `tools:` appearing first would otherwise become the default).
+.DEFAULT_GOAL := all
 
 all: $(TARGET)
+
+tools: gen_vector
 
 # --- GPU build: two TUs (host main.cpp + device kernel.cu), no rdc needed ---
 main.o: $(SRC_HOST) $(HDRS)

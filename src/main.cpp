@@ -116,6 +116,12 @@ int main(int argc, char** argv) {
 #ifdef USE_CUDA
         printf("backend: CUDA (device %d)\n", device_id);
         CrackResult r = cuda_crack(t, mask, begin, end - begin, device_id);
+        if (r.error) {
+            // A CUDA call failed: the keyspace was NOT fully searched, so we must not
+            // report "exhausted, no match" (that would read as "password isn't in range").
+            fprintf(stderr, "error: GPU backend did not complete the search (see message above); no verdict.\n");
+            return 3;
+        }
         bool found = r.found; uint64_t hit = r.index; int kind = r.kind;
 #else
         printf("backend: CPU (%d threads)\n", threads);

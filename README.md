@@ -12,15 +12,23 @@ of hashcat kernel mode **22500**, reimplemented as a standalone CUDA/C++ app tar
 | CPU reference (`src/*_ref.h`, `pipeline_ref.h`) | ✅ builds with g++, passes KATs + self-test |
 | Mask engine (custom charsets, index↔password) | ✅ CPU-validated |
 | CLI (`mbcrack`, multithreaded CPU backend) | ✅ works today |
-| **Phase-6 GPU backend** (T-table AES in shared mem, a3 amplifier, hoisted key1, `__launch_bounds__`) | ✅ device **logic validated bit-identical to CPU reference**; needs CUDA ≥ 12.8 to compile/run |
+| **Phase-6 GPU backend** (T-table AES in shared mem, a3 amplifier, hoisted key1, `__launch_bounds__`) | ✅ logic bit-identical to CPU ref **+ compiles & links for `sm_120` under real nvcc (CUDA 13.0)** |
 | Further tuning (register/occupancy sweep, MD5 pre-add hoist) | ⬜ requires on-hardware Nsight profiling |
 
-### Phase-6 validation (run via CUDA-qualifier stubs on the CPU, no GPU required)
+### Phase-6 validation
+**(a) Numerical — via CUDA-qualifier stubs on the CPU, no GPU:**
 - T-table AES-256 decrypt == golden byte-oriented AES on **100,000 random vectors** + FIPS-197 C.3.
 - Full kernel path (T-table AES + hoisted key1 + amplifier index math) == CPU reference on **all 676**
   candidates of a two-axis test mask; recovers `hashcat` at the correct keyspace index, **0 mismatches**.
-- Only the CUDA runtime glue (`cudaMemcpyToSymbol`, launch config, shared staging, atomics) is unexercised
-  here — that needs real nvcc + a GPU.
+
+**(b) Toolchain — real `nvcc` (CUDA 13.0.88) targeting `sm_120`, WSL2 Ubuntu, no GPU present:**
+- `make GPU_ARCH=120` compiles `main.cpp` + `kernel.cu` and links `mbcrack` (static cudart); `sm_120`
+  cubin confirmed via `cuobjdump -lelf`. `crack_kernel`: **128 reg, 5632 B smem, 1 barrier**.
+- On a driverless host the backend now **fails loudly** (`cudaSetDevice` error → exit 3, no false verdict).
+- Only kernel *execution* remains unexercised — that needs an actual `sm_120` GPU.
+
+The register/occupancy tradeoff (block=256, spills disappear only at 1 block/SM) is tabulated in
+[`DEVELOPMENT_PLAN.md`](DEVELOPMENT_PLAN.md) as the starting matrix for on-hardware tuning.
 
 ## Build & run — CPU (works now, no CUDA required)
 

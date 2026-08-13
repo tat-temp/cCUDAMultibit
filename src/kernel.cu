@@ -119,13 +119,15 @@ CrackResult cuda_crack(const Target& t, const Mask& m,
 {
     CrackResult out;
     cudaError_t err = cudaSetDevice(device_id);
-    if (err != cudaSuccess) { fprintf(stderr, "cudaSetDevice: %s\n", cudaGetErrorString(err)); return out; }
+    if (err != cudaSuccess) { fprintf(stderr, "cudaSetDevice: %s\n", cudaGetErrorString(err)); out.error = true; return out; }
 
-    cudaDeviceProp prop; cudaGetDeviceProperties(&prop, device_id);
+    cudaDeviceProp prop;
+    err = cudaGetDeviceProperties(&prop, device_id);
+    if (err != cudaSuccess) { fprintf(stderr, "cudaGetDeviceProperties: %s\n", cudaGetErrorString(err)); out.error = true; return out; }
     printf("device: %s  sm_%d%d  SMs=%d\n", prop.name, prop.major, prop.minor, prop.multiProcessorCount);
 
     const int L = m.length();
-    if (L < 1 || L > MB_MAX_LEN) { fprintf(stderr, "mask length %d out of range\n", L); return out; }
+    if (L < 1 || L > MB_MAX_LEN) { fprintf(stderr, "mask length %d out of range\n", L); out.error = true; return out; }
 
     // flatten per-position charsets
     std::vector<uint8_t> cs_data;
@@ -135,7 +137,7 @@ CrackResult cuda_crack(const Target& t, const Mask& m,
         cs_len[i] = (uint32_t)m.pos[i].size();
         for (char c : m.pos[i]) cs_data.push_back((uint8_t)c);
     }
-    if (cs_data.size() > MB_MAX_CS) { fprintf(stderr, "flattened charset too big (%zu)\n", cs_data.size()); return out; }
+    if (cs_data.size() > MB_MAX_CS) { fprintf(stderr, "flattened charset too big (%zu)\n", cs_data.size()); out.error = true; return out; }
 
     const uint32_t n0 = cs_len[0];
     const uint32_t cs0_off = cs_off[0];
@@ -167,8 +169,10 @@ CrackResult cuda_crack(const Target& t, const Mask& m,
     for (uint64_t done = 0; done < n_base; done += BASE_CHUNK) {
         const uint64_t this_bases = std::min<uint64_t>(BASE_CHUNK, n_base - done);
         crack_kernel<<<grid, block>>>(base_begin + done, this_bases);
-        err = cudaDeviceSynchronize();
-        if (err != cudaSuccess) { fprintf(stderr, "kernel: %s\n", cudaGetErrorString(err)); break; }
+        err = cudaGetLastError();       // catches launch-config failures immediately
+        if (err != cudaSuccess) { fprintf(stderr, "kernel launch: %s\n", cudaGetErrorString(err)); out.error = true; break; }
+        err = cudaDeviceSynchronize();  // catches faults during execution
+        if (err != cudaSuccess) { fprintf(stderr, "kernel: %s\n", cudaGetErrorString(err)); out.error = true; break; }
 
         DevResult r; cudaMemcpyFromSymbol(&r, d_res, sizeof(r));
         if (r.found) {

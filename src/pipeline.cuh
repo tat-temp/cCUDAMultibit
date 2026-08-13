@@ -15,6 +15,7 @@ namespace mb {
 // Shared-memory AES table pointers, bundled to keep signatures short.
 struct AesShared {
     const uint32_t *Td0, *Td1, *Td2, *Td3;
+    const uint32_t *IMC0, *IMC1, *IMC2, *IMC3;   // P1: InvMixColumns key-schedule tables
     const uint8_t  *sbox, *isbox;
 };
 
@@ -33,7 +34,7 @@ __device__ inline int dev_finish_from_key1(const uint8_t d1[16],
     for (int i = 0; i < 16; i++) { key[i] = d1[i]; key[16+i] = d2[i]; }
 
     uint32_t dk[60];
-    aes256_expand_dec(key, dk, tb.sbox, tb.Td0, tb.Td1, tb.Td2, tb.Td3);
+    aes256_expand_dec(key, dk, tb.sbox, tb.IMC0, tb.IMC1, tb.IMC2, tb.IMC3);
 
     // Diffuse the first ciphertext block through the 13 middle rounds, then reject on the CBC
     // first plaintext byte alone (~253/256 candidates die here) BEFORE computing the full final

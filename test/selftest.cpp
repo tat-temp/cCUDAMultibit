@@ -93,7 +93,7 @@ int main() {
             for (int i = 0; i < 32; i++) key[i] = (uint8_t)(rnd() >> 24);
             for (int i = 0; i < 16; i++) ct[i]  = (uint8_t)(rnd() >> 24);
             uint32_t dk[60];
-            aes256_expand_dec(key, dk, tb.sbox, tb.Td0, tb.Td1, tb.Td2, tb.Td3);
+            aes256_expand_dec(key, dk, tb.sbox, tb.IMC0, tb.IMC1, tb.IMC2, tb.IMC3);
             uint8_t got[16];
             aes256_decrypt_tt(dk, ct, got, tb.Td0, tb.Td1, tb.Td2, tb.Td3, tb.isbox);
             AES256 ref; ref.expand_key(key);
@@ -106,6 +106,22 @@ int main() {
         }
         if (mism) { printf("[FAIL] T-table AES decrypt != reference (%d/50000)\n", mism); failures++; }
         else printf("[ ok ] T-table AES-256 decrypt == reference (50000 random vectors)\n");
+    }
+
+    // ---- 5b. P1 invariant: the precomputed IMC tables equal the fused Tdk[sbox[b]] they replace ----
+    // The schedule InvMixColumns pass now reads IMCk[b] directly; this asserts IMCk[b] == Tdk[sbox[b]]
+    // for all 256 b, so a table-gen typo can't silently change any decrypt (defence-in-depth on top of
+    // the 50000-vector end-to-end check above, which already routes through the IMC path).
+    {
+        AesTd tb; aes_build_tables(tb);
+        int mism = 0;
+        for (int b = 0; b < 256; b++) {
+            uint8_t s = tb.sbox[b];
+            if (tb.IMC0[b] != tb.Td0[s] || tb.IMC1[b] != tb.Td1[s] ||
+                tb.IMC2[b] != tb.Td2[s] || tb.IMC3[b] != tb.Td3[s]) mism++;
+        }
+        if (mism) { printf("[FAIL] IMCk[b] != Tdk[sbox[b]] (%d/256)\n", mism); failures++; }
+        else printf("[ ok ] P1 IMC tables == Tdk[sbox[b]] (256/256)\n");
     }
 
     // ---- 6. Word-oriented MD5 message assembly == reference MD5, every length & shape ----
@@ -153,6 +169,7 @@ int main() {
     {
         AesTd tbl; aes_build_tables(tbl);
         AesShared sh; sh.Td0=tbl.Td0; sh.Td1=tbl.Td1; sh.Td2=tbl.Td2; sh.Td3=tbl.Td3;
+        sh.IMC0=tbl.IMC0; sh.IMC1=tbl.IMC1; sh.IMC2=tbl.IMC2; sh.IMC3=tbl.IMC3;
         sh.sbox=tbl.sbox; sh.isbox=tbl.isbox;
         int mism = 0, ntest = 0;
         auto cmp = [&](const uint8_t* pw, int L) {

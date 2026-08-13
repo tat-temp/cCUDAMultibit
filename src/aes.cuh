@@ -14,6 +14,11 @@ namespace mb {
 // ---- host-side table generation (fills what kernel.cu uploads) ----
 struct AesTd {
     uint32_t Td0[256], Td1[256], Td2[256], Td3[256];
+    // P1: precomputed InvMixColumns tables for the decrypt key schedule (IMCk[b] == Tdk[sbox[b]]).
+    // The schedule's middle-round transform needs Tdk[S[byte]] (the forward S-box cancels the inverse
+    // S-box baked into Td, leaving pure InvMixColumns). Folding that into IMCk turns the pass from a
+    // 2-deep sbox->Td dependent load into one lookup per state byte. Bit-identical by construction.
+    uint32_t IMC0[256], IMC1[256], IMC2[256], IMC3[256];
     uint8_t  sbox[256], isbox[256];
 };
 
@@ -50,6 +55,11 @@ inline void aes_build_tables(AesTd& t) {
         t.Td2[x] = ((uint32_t)d<<24)|((uint32_t)b<<16)|((uint32_t)e<<8)|n;   // ror16
         t.Td3[x] = ((uint32_t)n<<24)|((uint32_t)d<<16)|((uint32_t)b<<8)|e;   // ror24
     }
+    // P1: IMCk[b] = Tdk[sbox[b]] — pre-fold the schedule's sbox->Td indirection (see AesTd comment).
+    for (int b = 0; b < 256; b++) {
+        uint8_t s = t.sbox[b];
+        t.IMC0[b] = t.Td0[s]; t.IMC1[b] = t.Td1[s]; t.IMC2[b] = t.Td2[s]; t.IMC3[b] = t.Td3[s];
+    }
 }
 
 // ---- shared/device-callable core (host-callable too, via cuda_stub.h) ----
@@ -71,10 +81,12 @@ MB_AES_HD inline uint32_t aes_subword(uint32_t w, const uint8_t* S) {
 }
 
 // AES-256 decryption key schedule (equivalent inverse cipher). dk holds 60 words.
+// The middle-round InvMixColumns uses the precomputed IMC0..3 tables (IMCk[b] == Tdk[sbox[b]]);
+// the forward S-box S is still needed for RotWord/SubWord in the expansion itself.
 MB_AES_HD inline void aes256_expand_dec(const uint8_t key[32], uint32_t dk[60],
                                         const uint8_t* S,
-                                        const uint32_t* Td0, const uint32_t* Td1,
-                                        const uint32_t* Td2, const uint32_t* Td3)
+                                        const uint32_t* IMC0, const uint32_t* IMC1,
+                                        const uint32_t* IMC2, const uint32_t* IMC3)
 {
     const uint32_t Rcon[7] = {0x01000000,0x02000000,0x04000000,0x08000000,0x10000000,0x20000000,0x40000000};
     // Single-buffer, in-place (hashcat aes256_ExpandKey/InvertKey style): expand the forward schedule
@@ -97,13 +109,15 @@ MB_AES_HD inline void aes256_expand_dec(const uint8_t key[32], uint32_t dk[60],
             uint32_t tmp = dk[4*b + j]; dk[4*b + j] = dk[4*(14-b) + j]; dk[4*(14-b) + j] = tmp;
         }
     }
-    // InvMixColumns on the middle rounds 1..13 (S cancels the inv-S baked into Td => pure IMC)
+    // InvMixColumns on the middle rounds 1..13 via the precomputed IMC tables: one lookup per state
+    // byte instead of the old Tdk[S[byte]] (sbox load feeding a Td load). IMCk[b] == Tdk[S[b]], so
+    // this is bit-identical to the fused expression it replaces.
     #pragma unroll
     for (int r = 1; r <= 13; r++) {
         #pragma unroll
         for (int j = 0; j < 4; j++) {
             uint32_t w = dk[4*r + j];
-            dk[4*r + j] = Td0[S[(w>>24)&0xff]] ^ Td1[S[(w>>16)&0xff]] ^ Td2[S[(w>>8)&0xff]] ^ Td3[S[w&0xff]];
+            dk[4*r + j] = IMC0[(w>>24)&0xff] ^ IMC1[(w>>16)&0xff] ^ IMC2[(w>>8)&0xff] ^ IMC3[w&0xff];
         }
     }
 }

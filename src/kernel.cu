@@ -43,6 +43,7 @@ __constant__ uint32_t c_cs0_off;        // offset of position-0 charset in c_cs_
 
 // ---- AES tables in global memory (staged to shared each block) ----
 __device__ uint32_t g_Td0[256], g_Td1[256], g_Td2[256], g_Td3[256];
+__device__ uint32_t g_IMC0[256], g_IMC1[256], g_IMC2[256], g_IMC3[256];   // P1: InvMixColumns schedule tables
 __device__ uint8_t  g_sbox[256], g_isbox[256];
 
 struct DevResult { int found; unsigned long long index; uint8_t pw[32]; int kind; };
@@ -53,14 +54,17 @@ __launch_bounds__(MB_THREADS, MB_MINBLOCKS)
 __global__ void crack_kernel(uint64_t base_begin, uint64_t base_count)
 {
     __shared__ uint32_t sTd0[256], sTd1[256], sTd2[256], sTd3[256];
+    __shared__ uint32_t sIMC0[256], sIMC1[256], sIMC2[256], sIMC3[256];   // P1
     __shared__ uint8_t  sS[256], sIS[256];
     for (int i = threadIdx.x; i < 256; i += blockDim.x) {
         sTd0[i]=g_Td0[i]; sTd1[i]=g_Td1[i]; sTd2[i]=g_Td2[i]; sTd3[i]=g_Td3[i];
+        sIMC0[i]=g_IMC0[i]; sIMC1[i]=g_IMC1[i]; sIMC2[i]=g_IMC2[i]; sIMC3[i]=g_IMC3[i];
         sS[i]=g_sbox[i];  sIS[i]=g_isbox[i];
     }
     __syncthreads();
 
-    AesShared tb; tb.Td0=sTd0; tb.Td1=sTd1; tb.Td2=sTd2; tb.Td3=sTd3; tb.sbox=sS; tb.isbox=sIS;
+    AesShared tb; tb.Td0=sTd0; tb.Td1=sTd1; tb.Td2=sTd2; tb.Td3=sTd3;
+    tb.IMC0=sIMC0; tb.IMC1=sIMC1; tb.IMC2=sIMC2; tb.IMC3=sIMC3; tb.sbox=sS; tb.isbox=sIS;
 
     const int      L  = c_pw_len;
     const uint32_t n0 = c_n0;
@@ -115,6 +119,10 @@ static void upload_tables() {
     cudaMemcpyToSymbol(g_Td1, t.Td1, sizeof(t.Td1));
     cudaMemcpyToSymbol(g_Td2, t.Td2, sizeof(t.Td2));
     cudaMemcpyToSymbol(g_Td3, t.Td3, sizeof(t.Td3));
+    cudaMemcpyToSymbol(g_IMC0, t.IMC0, sizeof(t.IMC0));   // P1
+    cudaMemcpyToSymbol(g_IMC1, t.IMC1, sizeof(t.IMC1));
+    cudaMemcpyToSymbol(g_IMC2, t.IMC2, sizeof(t.IMC2));
+    cudaMemcpyToSymbol(g_IMC3, t.IMC3, sizeof(t.IMC3));
     cudaMemcpyToSymbol(g_sbox, t.sbox, 256);
     cudaMemcpyToSymbol(g_isbox, t.isbox, 256);
 }

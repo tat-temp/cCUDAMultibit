@@ -25,6 +25,9 @@ namespace mb {
 #define MB_MAX_LEN 32
 #define MB_MAX_CS  1024
 #define MB_THREADS 256                  // tune with `make gate` / Nsight Compute
+#ifndef MB_MINBLOCKS
+#define MB_MINBLOCKS 2                  // __launch_bounds__ minBlocksPerMP; build knob: make MINBLOCKS=1|2|3
+#endif
 
 // ---- constant memory: target + mask ----
 __constant__ uint8_t  c_salt[8];
@@ -44,7 +47,7 @@ struct DevResult { int found; unsigned long long index; uint8_t pw[32]; int kind
 __device__ DevResult d_res;
 
 // base index in [base_begin, base_begin+base_count); each base fans out over c_n0 candidates.
-__launch_bounds__(MB_THREADS, 2)
+__launch_bounds__(MB_THREADS, MB_MINBLOCKS)
 __global__ void crack_kernel(uint64_t base_begin, uint64_t base_count)
 {
     __shared__ uint32_t sTd0[256], sTd1[256], sTd2[256], sTd3[256];
@@ -184,6 +187,85 @@ CrackResult cuda_crack(const Target& t, const Mask& m,
         fflush(stdout);
     }
     return out;
+}
+
+// ---- throughput benchmark ----
+// Runs the real crack_kernel over a synthetic, non-matching target so every candidate
+// takes the full per-guess path (MD5 key1 + AES first block + early-skip, ~253/256), i.e.
+// exactly the cost of an exhaustive search. Times ONLY the kernels via CUDA events (device
+// init, table upload, and JIT are done in a warm-up launch and excluded). Returns GH/s, or
+// a negative value on any CUDA error. The mask is fixed (L=8, 64-symbol set, n0=64) so runs
+// are reproducible; throughput is mask-dependent, so report it alongside the number.
+double cuda_benchmark(int device_id, uint64_t target_candidates)
+{
+    cudaError_t err = cudaSetDevice(device_id);
+    if (err != cudaSuccess) { fprintf(stderr, "cudaSetDevice: %s\n", cudaGetErrorString(err)); return -1.0; }
+    cudaDeviceProp prop;
+    err = cudaGetDeviceProperties(&prop, device_id);
+    if (err != cudaSuccess) { fprintf(stderr, "cudaGetDeviceProperties: %s\n", cudaGetErrorString(err)); return -1.0; }
+    printf("device: %s  sm_%d%d  SMs=%d\n", prop.name, prop.major, prop.minor, prop.multiProcessorCount);
+    printf("config: MB_THREADS=%d  __launch_bounds__ minBlocks=%d\n", MB_THREADS, MB_MINBLOCKS);
+
+    // synthetic mask: L=8, a 64-symbol charset at every position (n0 = 64).
+    static const char CS64[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/";
+    const int      L  = 8;
+    const uint32_t n0 = 64;
+    std::vector<uint8_t> cs_data;
+    uint32_t cs_off[MB_MAX_LEN], cs_len[MB_MAX_LEN];
+    for (int i = 0; i < L; i++) {
+        cs_off[i] = (uint32_t)cs_data.size();
+        cs_len[i] = n0;
+        for (uint32_t c = 0; c < n0; c++) cs_data.push_back((uint8_t)CS64[c]);
+    }
+    const uint32_t cs0_off = cs_off[0];
+
+    // synthetic target: fixed byte patterns; will not validate, so no candidate "hits".
+    uint8_t salt[8], data[32];
+    for (int i = 0; i < 8;  i++) salt[i] = (uint8_t)(0x11 * i + 1);
+    for (int i = 0; i < 32; i++) data[i] = (uint8_t)(7 * i + 3);
+
+    upload_tables();
+    cudaMemcpyToSymbol(c_salt, salt, 8);
+    cudaMemcpyToSymbol(c_data, data, 32);
+    cudaMemcpyToSymbol(c_cs_data, cs_data.data(), cs_data.size());
+    cudaMemcpyToSymbol(c_cs_off, cs_off, sizeof(uint32_t) * L);
+    cudaMemcpyToSymbol(c_cs_len, cs_len, sizeof(uint32_t) * L);
+    cudaMemcpyToSymbol(c_pw_len, &L, sizeof(int));
+    cudaMemcpyToSymbol(c_n0, &n0, sizeof(uint32_t));
+    cudaMemcpyToSymbol(c_cs0_off, &cs0_off, sizeof(uint32_t));
+    DevResult init; memset(&init, 0, sizeof(init));
+    cudaMemcpyToSymbol(d_res, &init, sizeof(init));
+
+    const int block = MB_THREADS;
+    const int grid  = prop.multiProcessorCount * 32;
+    const uint64_t n_base = (target_candidates + n0 - 1) / n0;   // round up to whole bases
+    const uint64_t BASE_CHUNK = 1ull << 22;
+
+    // warm-up: context creation + JIT + table staging (excluded from the timed section).
+    crack_kernel<<<grid, block>>>(0, std::min<uint64_t>(BASE_CHUNK, n_base));
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) { fprintf(stderr, "warm-up kernel: %s\n", cudaGetErrorString(err)); return -1.0; }
+    cudaMemcpyToSymbol(d_res, &init, sizeof(init));             // re-arm (warm-up left it 0 anyway)
+
+    cudaEvent_t ev0, ev1; cudaEventCreate(&ev0); cudaEventCreate(&ev1);
+    cudaEventRecord(ev0);
+    for (uint64_t done = 0; done < n_base; done += BASE_CHUNK)
+        crack_kernel<<<grid, block>>>(done, std::min<uint64_t>(BASE_CHUNK, n_base - done));
+    cudaEventRecord(ev1);
+    err = cudaEventSynchronize(ev1);
+    if (err != cudaSuccess) { fprintf(stderr, "benchmark kernel: %s\n", cudaGetErrorString(err)); return -1.0; }
+    float ms = 0.f; cudaEventElapsedTime(&ms, ev0, ev1);
+    cudaEventDestroy(ev0); cudaEventDestroy(ev1);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) { fprintf(stderr, "benchmark launch: %s\n", cudaGetErrorString(err)); return -1.0; }
+
+    const double cand = (double)n_base * (double)n0;
+    const double secs = (double)ms / 1000.0;
+    const double ghs  = cand / secs / 1e9;
+    printf("benchmark: mask=8x%u (n0=%u)  candidates=%.3e  kernel_time=%.4f s\n",
+           n0, n0, cand, secs);
+    printf("throughput: %.3f GH/s  (%.1f MH/s)\n", ghs, ghs * 1000.0);
+    return ghs;
 }
 
 } // namespace mb

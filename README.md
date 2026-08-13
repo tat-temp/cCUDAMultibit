@@ -97,6 +97,33 @@ make cpu             # CPU-only build + selftest, no CUDA needed
 cmake -S . -B build-cuda -DUSE_CUDA=ON -DCMAKE_BUILD_TYPE=Release && cmake --build build-cuda
 ```
 
+## Benchmark throughput (GPU)
+
+`--benchmark` runs the real kernel over a synthetic, non-matching target so every guess takes the full
+per-candidate path (MD5 key1 + AES first block + early-skip) — i.e. the cost of an exhaustive search. It
+times **only** the kernel via CUDA events (device init, table upload, and JIT happen in an excluded
+warm-up) and prints GH/s:
+
+```bash
+./mbcrack --benchmark               # ~2e9 guesses (default), fixed reproducible mask
+```
+```bash
+./mbcrack --benchmark 8000000000 -d 0   # pick guess count and GPU
+```
+
+Compare against hashcat on the same card with `hashcat -b -m 22500`. Throughput is mask-dependent, so the
+benchmark pins a fixed mask (L=8, 64-symbol set); report the number next to the card.
+
+**Occupancy/register tuning** — the `__launch_bounds__(256, N)` knob (spills vs occupancy; see the matrix
+in [`DEVELOPMENT_PLAN.md`](DEVELOPMENT_PLAN.md)). Changing it needs a clean rebuild:
+
+```bash
+make clean && make MINBLOCKS=1 && ./mbcrack --benchmark
+```
+
+`N=1` removes spills at low occupancy, `N=2` (default) is the middle, `N=3` maximizes occupancy with heavy
+spills — pick the winner by measured GH/s. `make gate MINBLOCKS=N` reports the matching register ceiling.
+
 ## Layout
 
 ```

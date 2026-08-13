@@ -13,6 +13,9 @@
 //     --limit N                   number of candidates to try
 //     -j N                        CPU threads (CPU backend only; default hw concurrency)
 //     -d N                        CUDA device id (GPU backend)
+//   benchmark (GPU build only):
+//     mbcrack --benchmark [N] [-d dev]   synthetic throughput test over N guesses (default 2e9);
+//                                        times only the kernel and prints GH/s. No hash/mask.
 //   examples:
 //     mbcrack '$multibit$1*e591...34de' -a 3 'hashca?l'
 //     mbcrack wallet.hash -a 3 '?1?1?1?1?1?1?1' -1 abcdefghijklmnopqrstuvwxyz
@@ -75,7 +78,30 @@ static void cpu_worker(const Target* t, const Mask* m, uint64_t begin, uint64_t 
 
 int main(int argc, char** argv) {
     try {
-        if (argc < 4) { fprintf(stderr, "usage: mbcrack <hash|file> -a 3 <mask> [opts]\n"); return 2; }
+        // --benchmark [candidates] [-d dev]: synthetic GPU throughput test; no hash/mask needed.
+        for (int i = 1; i < argc; i++) {
+            if (std::string(argv[i]) != "--benchmark") continue;
+#ifdef USE_CUDA
+            uint64_t bench_count = 2000000000ull;   // ~2e9 guesses (override: --benchmark <N>)
+            int dev = 0;
+            for (int j = 1; j < argc; j++) {
+                std::string a = argv[j];
+                if (a == "-d" && j + 1 < argc) dev = atoi(argv[++j]);
+                else if (a == "--benchmark" && j + 1 < argc) {
+                    char* endp = nullptr;
+                    unsigned long long v = strtoull(argv[j + 1], &endp, 10);
+                    if (endp && *endp == '\0' && v > 0) { bench_count = v; j++; }
+                }
+            }
+            double ghs = cuda_benchmark(dev, bench_count);
+            return ghs >= 0.0 ? 0 : 3;
+#else
+            fprintf(stderr, "error: --benchmark requires the CUDA build (build with USE_CUDA / make)\n");
+            return 2;
+#endif
+        }
+
+        if (argc < 4) { fprintf(stderr, "usage: mbcrack <hash|file> -a 3 <mask> [opts]  |  mbcrack --benchmark [N] [-d dev]\n"); return 2; }
 
         std::string hash_arg = argv[1];
         std::string mask_str;

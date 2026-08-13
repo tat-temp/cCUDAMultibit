@@ -24,4 +24,9 @@ CrackResult cuda_crack(const Target& t, const Mask& m,
                        uint64_t skip, uint64_t count,
                        int device_id);
 
+// Synthetic throughput benchmark: runs crack_kernel over `target_candidates` non-matching
+// guesses and times only the kernels (GPU init/upload excluded). Prints device/config/rate;
+// returns GH/s, or a negative value on any CUDA error.
+double cuda_benchmark(int device_id, uint64_t target_candidates);
+
 } // namespace mb

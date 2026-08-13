@@ -14,8 +14,8 @@
 # nvcc's host compiler defaults to g++ on Linux (override: make HOSTCXX=g++-13).
 #
 # Tuning knob (occupancy vs register spills, see DEVELOPMENT_PLAN.md matrix):
-#   make MINBLOCKS=1|2|3     # __launch_bounds__(256,N); default 2. `make gate` tracks the ceiling.
-#   A/B on-device:  make clean && make MINBLOCKS=1 && ./mbcrack --benchmark   (clean: obj is cached)
+#   make MINBLOCKS=1|2|3     # __launch_bounds__(256,N); default 1. `make gate` tracks the ceiling.
+#   A/B on-device:  make clean && make MINBLOCKS=2 && ./mbcrack --benchmark   (clean: obj is cached)
 
 TARGET      := mbcrack
 CPU_TARGET  := mbcrack_cpu
@@ -47,9 +47,9 @@ GENCODE    := $(foreach a,$(SM_ARCHS),-gencode arch=compute_$(a),code=sm_$(a))
 NATIVE_GENCODE := -gencode arch=compute_$(GPU_ARCH),code=sm_$(GPU_ARCH)
 
 # __launch_bounds__(256, MINBLOCKS) — the occupancy/register knob (see the tuning matrix in
-# DEVELOPMENT_PLAN.md). 1 = no spills / low occupancy, 2 = default, 3 = high occupancy / heavy
-# spills. Changing it needs a rebuild: make clean && make MINBLOCKS=1 && ./mbcrack --benchmark
-MINBLOCKS  ?= 2
+# DEVELOPMENT_PLAN.md). 1 = default (no spills, fastest on RTX 5090), 2 = spills/more occupancy,
+# 3 = heavy spills. Changing it needs a rebuild: make clean && make MINBLOCKS=2 && ./mbcrack --benchmark
+MINBLOCKS  ?= 1
 
 NVCC_FLAGS := -O3 -use_fast_math --ptxas-options=-O3 $(GENCODE) -DUSE_CUDA -DMB_MINBLOCKS=$(MINBLOCKS) -Isrc
 CXXFLAGS   := -std=c++17 -Xcompiler -pthread -ccbin $(HOSTCXX)

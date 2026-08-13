@@ -396,27 +396,29 @@ multibit/
 - **Phase 6 — Optimize.** ✅ *Implemented & logic-validated.* Delivered: (1) AES-256 **T-tables in shared
   memory** (`aes.cuh`, staged once/block), (2) the **a3 amplifier** — one thread per base word, inner loop
   over the fastest charset position (`kernel.cu`), (3) **hoisted key1** MD5 message assembly per base,
-  (4) `__launch_bounds__(256,2)` + single `__syncthreads`. Validated bit-identical to the CPU reference via
-  qualifier stubs (T-table AES over 100k vectors; full kernel path over a 676-candidate two-axis mask,
-  0 mismatches). **Toolchain-validated:** real `nvcc` (CUDA 13.0.88) compiles `kernel.cu` + `main.cpp`
-  and links `mbcrack` for `sm_120` (static cudart, `sm_120` cubin confirmed via `cuobjdump -lelf`);
-  `crack_kernel` = 128 reg / 5632 B smem / 1 barrier. `make gate` surfaces the ptxas register/spill
-  numbers. **Remaining (needs hardware):** Nsight Compute register/occupancy sweep, `ks/dk[60]` spill
-  vs stack-frame decision, block-size sweep, bank-conflict check → then **Gate:** documented GH/s,
-  ≥ hashcat m22500 on the same 5090.
+  (4) `__launch_bounds__(256, MB_MINBLOCKS)` (default 1) + single `__syncthreads`. Validated bit-identical
+  to the CPU reference via qualifier stubs (T-table AES over 100k vectors; full kernel path over a
+  676-candidate two-axis mask, 0 mismatches). **Toolchain-validated:** real `nvcc` (CUDA 13.0.88) compiles
+  `kernel.cu` + `main.cpp` and links `mbcrack` for `sm_120` (static cudart, `sm_120` cubin confirmed via
+  `cuobjdump -lelf`). `make gate` surfaces the ptxas register/spill numbers; `./mbcrack --benchmark` reports
+  GH/s. **Benchmarked on hardware (below).** Remaining: bank-conflict check, and whether AES round keys can
+  leave the register file (see note) → **Gate:** ≥ hashcat m22500 on the same 5090.
 
-  **Register/occupancy starting matrix** (measured with CUDA 13.0 `nvcc -Xptxas -v`, `sm_120`, block=256;
-  clock-independent codegen — pick the winner by actual GH/s on the 5090):
+  **`__launch_bounds__(256,N)` sweep — measured on a real RTX 5090 (sm_120, 170 SMs), CUDA 13,
+  `./mbcrack --benchmark` (mask 8×64, 2e9 guesses):**
 
-  | `__launch_bounds__(256,N)` | reg cap | actual reg | spill (st/ld) | requested blocks/SM |
+  | N | actual reg | spill (st/ld) | occupancy | **GH/s** |
   |---|---|---|---|---|
-  | `N=1` | 256 | 232 | **0 / 0** | 1 (256 thr, 12.5%) |
-  | `N=2` *(current default)* | 128 | 128 | 128 / 136 B | 2 (512 thr, 25%) |
-  | `N=3` | 85 | 80 | 320 / 384 B | 3 (768 thr, 37.5%) |
+  | **`N=1` (default)** | 232 | **0 / 0** | 1 blk/SM (12.5%) | **5.79** 🏆 |
+  | `N=2` | 128 | 128 / 136 B | 2 blk/SM (25%) | 5.46 |
+  | `N=3` | 80 | 320 / 384 B | 3 blk/SM (37.5%) | 4.30 |
 
-  Spills vanish only by dropping to 1 block/SM; the shipped `N=2` is the middle ground. For a compute-bound
-  MD5+AES kernel, more occupancy often hides the spill latency — but that is a throughput measurement, not a
-  static call, so the default is left at `N=2` until benched on-device.
+  **Result: the kernel is register/spill-bound, not occupancy-bound.** Raising occupancy only buys `dk[60]`
+  spills and *loses* throughput (N=1→N=3 is −26%); 12.5% occupancy already hides latency because each thread
+  carries enough independent MD5+AES work. So the shipped default is **N=1**. Open lever: at N=1 regs=232
+  (near the 255 cap) with zero spills — if AES round keys could leave the register file (shared/constant, or
+  recompute-on-the-fly) and drop regs under 128 *without* spilling, N=2 would become spill-free and could win
+  on occupancy. Untested; the `make MINBLOCKS=` knob makes re-benching a one-liner.
 - **Phase 7 — Hardening (optional).** Multi-GPU, multiple wallets in one pass, mask files / `?d?l?u?s`
   built-ins, `.hcmask` compatibility, keyspace distribution across machines.
 

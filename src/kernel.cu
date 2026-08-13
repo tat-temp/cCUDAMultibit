@@ -26,8 +26,8 @@ namespace mb {
 #define MB_MAX_CS  1024
 #define MB_THREADS 256                  // tune with `make gate` / Nsight Compute
 #ifndef MB_MINBLOCKS
-#define MB_MINBLOCKS 2                  // __launch_bounds__ minBlocksPerMP; build knob: make MINBLOCKS=1|2|3
-#endif
+#define MB_MINBLOCKS 1                  // __launch_bounds__ minBlocksPerMP; build knob: make MINBLOCKS=1|2|3
+#endif                                 // default 1: measured fastest on RTX 5090 (register/spill-bound)
 
 // ---- constant memory: target + mask ----
 __constant__ uint8_t  c_salt[8];

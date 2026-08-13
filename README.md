@@ -12,8 +12,8 @@ of hashcat kernel mode **22500**, reimplemented as a standalone CUDA/C++ app tar
 | CPU reference (`src/*_ref.h`, `pipeline_ref.h`) | ✅ builds with g++, passes KATs + self-test |
 | Mask engine (custom charsets, index↔password) | ✅ CPU-validated |
 | CLI (`mbcrack`, multithreaded CPU backend) | ✅ works today |
-| **Phase-6 GPU backend** (T-table AES in shared mem, a3 amplifier, hoisted key1, `__launch_bounds__`) | ✅ logic bit-identical to CPU ref **+ compiles & links for `sm_120` under real nvcc (CUDA 13.0)** |
-| Further tuning (register/occupancy sweep, MD5 pre-add hoist) | ⬜ requires on-hardware Nsight profiling |
+| **Phase-6 GPU backend** (T-table AES in shared mem, a3 amplifier, hoisted key1, `__launch_bounds__`) | ✅ logic bit-identical to CPU ref, runs on **RTX 5090 (`sm_120`)** at **~5.8 GH/s** |
+| Occupancy/register tuning (`__launch_bounds__` sweep) | ✅ benchmarked on 5090 → default `MINBLOCKS=1` (no spills wins); AES-key register relief ⬜ |
 
 ### Phase-6 validation
 **(a) Numerical — via CUDA-qualifier stubs on the CPU, no GPU:**
@@ -21,14 +21,14 @@ of hashcat kernel mode **22500**, reimplemented as a standalone CUDA/C++ app tar
 - Full kernel path (T-table AES + hoisted key1 + amplifier index math) == CPU reference on **all 676**
   candidates of a two-axis test mask; recovers `hashcat` at the correct keyspace index, **0 mismatches**.
 
-**(b) Toolchain — real `nvcc` (CUDA 13.0.88) targeting `sm_120`, WSL2 Ubuntu, no GPU present:**
-- `make GPU_ARCH=120` compiles `main.cpp` + `kernel.cu` and links `mbcrack` (static cudart); `sm_120`
-  cubin confirmed via `cuobjdump -lelf`. `crack_kernel`: **128 reg, 5632 B smem, 1 barrier**.
-- On a driverless host the backend now **fails loudly** (`cudaSetDevice` error → exit 3, no false verdict).
-- Only kernel *execution* remains unexercised — that needs an actual `sm_120` GPU.
+**(b) Toolchain + hardware — real `nvcc` (CUDA 13.0.88), `sm_120`:**
+- `make` compiles `main.cpp` + `kernel.cu` and links `mbcrack` (static cudart); `sm_120` cubin confirmed
+  via `cuobjdump -lelf`. Default build (`MINBLOCKS=1`): `crack_kernel` = **232 reg, 0 spill, 5632 B smem**.
+- Runs on a real **RTX 5090** at **~5.8 GH/s** (`--benchmark`); see the tuning matrix below.
+- On a driverless host the backend **fails loudly** (`cudaSetDevice` error → exit 3, no false verdict).
 
-The register/occupancy tradeoff (block=256, spills disappear only at 1 block/SM) is tabulated in
-[`DEVELOPMENT_PLAN.md`](DEVELOPMENT_PLAN.md) as the starting matrix for on-hardware tuning.
+The measured `__launch_bounds__` sweep (N=1 wins; the kernel is register/spill-bound) is tabulated in
+[`DEVELOPMENT_PLAN.md`](DEVELOPMENT_PLAN.md).
 
 ## Build & run — CPU (works now, no CUDA required)
 
@@ -118,11 +118,12 @@ benchmark pins a fixed mask (L=8, 64-symbol set); report the number next to the 
 in [`DEVELOPMENT_PLAN.md`](DEVELOPMENT_PLAN.md)). Changing it needs a clean rebuild:
 
 ```bash
-make clean && make MINBLOCKS=1 && ./mbcrack --benchmark
+make clean && make MINBLOCKS=2 && ./mbcrack --benchmark
 ```
 
-`N=1` removes spills at low occupancy, `N=2` (default) is the middle, `N=3` maximizes occupancy with heavy
-spills — pick the winner by measured GH/s. `make gate MINBLOCKS=N` reports the matching register ceiling.
+Measured on a real **RTX 5090** (`--benchmark`, 2e9 guesses): **N=1 → 5.79 GH/s** (no spills), N=2 → 5.46,
+N=3 → 4.30 — the kernel is register/spill-bound, so **N=1 is the shipped default**. The knob is kept for
+re-benching on other cards. `make gate MINBLOCKS=N` reports the matching register ceiling.
 
 ## Layout
 

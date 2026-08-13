@@ -16,7 +16,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 if(USE_CUDA)
     set(CMAKE_CUDA_STANDARD 17)
     set(CMAKE_CUDA_ARCHITECTURES 120)          # RTX 5090 = sm_120  (requires CUDA >= 12.8)
-    set(MB_MINBLOCKS 2 CACHE STRING "__launch_bounds__ minBlocksPerMP (1|2|3); occupancy/spill knob")
+    set(MB_MINBLOCKS 1 CACHE STRING "__launch_bounds__ minBlocksPerMP (1|2|3); occupancy/spill knob; 1=fastest on RTX 5090")
     add_executable(mbcrack src/main.cpp src/kernel.cu)
     target_compile_definitions(mbcrack PRIVATE USE_CUDA MB_MINBLOCKS=${MB_MINBLOCKS})
     target_compile_options(mbcrack PRIVATE

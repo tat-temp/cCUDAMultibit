@@ -9,6 +9,11 @@
   #define MB_MD5_HD __host__ __device__
 #else
   #define MB_MD5_HD
+  // Host (g++) compile of this device header — used by the selftest MD5 KAT. nvcc-only
+  // attributes have no host meaning; map __forceinline__ to plain inline so it compiles.
+  #ifndef __forceinline__
+  #define __forceinline__ inline
+  #endif
 #endif
 
 namespace mb {
@@ -16,24 +21,37 @@ namespace mb {
 MB_MD5_HD __forceinline__ uint32_t drotl(uint32_t x, int c) { return (x << c) | (x >> (32 - c)); }
 
 // Build the padded single-block message words for MD5(a||b||c). total len MUST be <= 55.
+// Word-oriented: assembles M[16] directly with u32 ops and NO uint8_t msg[64] scratch. Every
+// M[w] uses compile-time byte positions, so M register-promotes instead of spilling a 64-byte
+// local array (the bulk of the per-candidate stack frame). The variable-length fields a/b/c are
+// read straight from their existing buffers — no new local array — and after the callers' literal
+// la/lb/lc are inlined + constant-propagated this specializes to near-optimal per-shape code
+// (digest/pw at constant indices; only the salt tail runtime-indexed). Bit-identical to the old
+// byte-buffer version — proven exhaustively by the selftest MD5 message-assembly KAT.
 MB_MD5_HD inline void d_md5_buildM(const uint8_t* a, int la,
                                    const uint8_t* b, int lb,
                                    const uint8_t* c, int lc,
                                    uint32_t M[16])
 {
-    uint8_t msg[64];
+    const int      L    = la + lb + lc;      // total message bytes (<= 55) => exactly one block
+    const uint32_t bits = (uint32_t)L * 8u;  // MD5 bit-length field; fits u32 since L <= 55
     #pragma unroll
-    for (int i = 0; i < 64; i++) msg[i] = 0;
-    int p = 0;
-    for (int i = 0; i < la; i++) msg[p++] = a[i];
-    for (int i = 0; i < lb; i++) msg[p++] = b[i];
-    for (int i = 0; i < lc; i++) msg[p++] = c[i];
-    msg[p] = 0x80;
-    uint32_t bits = (uint32_t)(la + lb + lc) * 8u;
-    msg[56] = (uint8_t)bits; msg[57] = (uint8_t)(bits>>8); msg[58] = (uint8_t)(bits>>16); msg[59] = (uint8_t)(bits>>24);
-    #pragma unroll
-    for (int i = 0; i < 16; i++)
-        M[i] = (uint32_t)msg[i*4] | ((uint32_t)msg[i*4+1]<<8) | ((uint32_t)msg[i*4+2]<<16) | ((uint32_t)msg[i*4+3]<<24);
+    for (int w = 0; w < 16; w++) {
+        uint32_t word = 0;
+        #pragma unroll
+        for (int r = 0; r < 4; r++) {
+            const int k = 4*w + r;           // compile-time byte position 0..63
+            uint32_t v;
+            if      (k <  la)            v = a[k];               // a[k]: k const, guarded
+            else if (k <  la + lb)      v = b[k - la];          // b tail
+            else if (k <  L)            v = c[k - la - lb];     // c tail (skipped when lc==0)
+            else if (k == L)            v = 0x80u;              // padding terminator
+            else if (k >= 56 && k < 60) v = (bits >> (8*(k-56))) & 0xffu; // LE bit-length (low word)
+            else                        v = 0u;                 // zero pad / high length bytes
+            word |= v << (8*r);
+        }
+        M[w] = word;
+    }
 }
 
 // Full MD5 compression of one prepared block. out = 16-byte little-endian digest.

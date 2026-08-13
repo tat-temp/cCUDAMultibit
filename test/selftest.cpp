@@ -7,6 +7,7 @@
 #include "pipeline_ref.h"
 #include "mask.h"
 #include "aes.cuh"      // T-table AES (aes256_expand_dec / aes256_decrypt_tt) — host-callable via MB_AES_HD
+#include "md5.cuh"      // device MD5 (d_md5 / d_md5_buildM) — host-callable via MB_MD5_HD
 
 using namespace mb;
 
@@ -99,6 +100,44 @@ int main() {
         }
         if (mism) { printf("[FAIL] T-table AES decrypt != reference (%d/50000)\n", mism); failures++; }
         else printf("[ ok ] T-table AES-256 decrypt == reference (50000 random vectors)\n");
+    }
+
+    // ---- 6. Word-oriented MD5 message assembly == reference MD5, every length & shape ----
+    // Step 2 removed the uint8_t msg[64] byte buffer; d_md5(a,la,b,lb,c,lc) must still equal
+    // md5(a||b||c) for EVERY length the KDF can produce. The risk is the salt tail's placement
+    // relative to the variable pw_len (word-boundary math), so sweep all lengths + both KDF shapes.
+    {
+        uint32_t seed = 0x01234567u;
+        auto rnd  = [&]() { seed = seed*1664525u + 1013904223u; return seed; };
+        auto fill = [&](uint8_t* p, int n) { for (int i = 0; i < n; i++) p[i] = (uint8_t)(rnd() >> 24); };
+        int mism = 0, ntest = 0;
+        uint8_t a[64], b[64], c[64], cat[64], got[16], exp[16];
+
+        auto check = [&](int la, int lb, int lc) {
+            fill(a, la); fill(b, lb); fill(c, lc);
+            int p = 0;
+            for (int i = 0; i < la; i++) cat[p++] = a[i];
+            for (int i = 0; i < lb; i++) cat[p++] = b[i];
+            for (int i = 0; i < lc; i++) cat[p++] = c[i];
+            md5(cat, p, exp);                       // reference: MD5 of the concatenation
+            d_md5(a, la, b, lb, c, lc, got);        // device word-oriented assembly + compress
+            ntest++;
+            if (memcmp(got, exp, 16) != 0) mism++;
+        };
+
+        for (int L = 1; L <= 47; L++) check(L, 8, 0);   // Shape A (key1): pw(L)||salt(8), total<=55
+        for (int L = 1; L <= 31; L++) check(16, L, 8);  // Shape B (key2/iv): dgst(16)||pw(L)||salt(8)
+        for (int t = 0; t <= 55; t++) check(t, 0, 0);   // single field, every length incl. 0 and 55
+        for (int la = 0; la <= 20; la++)                // vary salt-tail alignment against a prefix
+            for (int lc = 0; lc <= 8; lc++)
+                if (la + 8 + lc <= 55) check(la, 8, lc);
+        for (int t = 0; t < 4000; t++) {                // random triples across the legal range
+            int la = rnd() % 16, lb = rnd() % 16, lc = rnd() % 8;   // worst case 15+15+7=37 <= 55
+            check(la, lb, lc);
+        }
+
+        if (mism) { printf("[FAIL] word MD5 assembly != reference (%d/%d vectors)\n", mism, ntest); failures++; }
+        else printf("[ ok ] word MD5 assembly == reference (%d vectors: shapes A/B + edges + random)\n", ntest);
     }
 
     printf(failures ? "\nRESULT: %d FAILURE(S)\n" : "\nRESULT: ALL PASS\n", failures);

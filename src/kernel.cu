@@ -29,15 +29,6 @@ namespace mb {
 #define MB_MINBLOCKS 1                  // __launch_bounds__ minBlocksPerMP; build knob: make MINBLOCKS=1|2|3
 #endif                                 // default 1: measured fastest on RTX 5090 (register/spill-bound)
 
-// AESKEYS=shared: per-thread 60-word AES schedule in dynamic shared memory. Pad the per-thread
-// stride to 61 words (coprime with 32) so warp-uniform dk[k] accesses hit 32 distinct banks.
-#if MB_AES_KEYS_MODE == 2
-  #define MB_SCHED_STRIDE 61
-  #define MB_DYN_SMEM ((size_t)MB_THREADS * MB_SCHED_STRIDE * sizeof(uint32_t))
-#else
-  #define MB_DYN_SMEM ((size_t)0)
-#endif
-
 // ---- constant memory: target + mask ----
 __constant__ uint8_t  c_salt[8];
 __constant__ uint8_t  c_data[32];
@@ -68,12 +59,6 @@ __global__ void crack_kernel(uint64_t base_begin, uint64_t base_count)
     __syncthreads();
 
     AesShared tb; tb.Td0=sTd0; tb.Td1=sTd1; tb.Td2=sTd2; tb.Td3=sTd3; tb.sbox=sS; tb.isbox=sIS;
-#if MB_AES_KEYS_MODE == 2
-    extern __shared__ uint32_t sSched[];               // blockDim.x * MB_SCHED_STRIDE words
-    tb.sched = &sSched[threadIdx.x * MB_SCHED_STRIDE]; // this thread's contiguous 60-word slab
-#else
-    tb.sched = nullptr;
-#endif
 
     const int      L  = c_pw_len;
     const uint32_t n0 = c_n0;
@@ -132,21 +117,6 @@ static void upload_tables() {
     cudaMemcpyToSymbol(g_isbox, t.isbox, 256);
 }
 
-// AESKEYS=shared needs > 48 KB dynamic shared/block, which requires an explicit opt-in.
-// No-op (returns true) for the register-key builds. Call once before launching.
-static bool prep_launch() {
-#if MB_AES_KEYS_MODE == 2
-    cudaError_t e = cudaFuncSetAttribute(crack_kernel,
-                        cudaFuncAttributeMaxDynamicSharedMemorySize, (int)MB_DYN_SMEM);
-    if (e != cudaSuccess) {
-        fprintf(stderr, "cudaFuncSetAttribute(dyn_smem=%zu): %s\n",
-                (size_t)MB_DYN_SMEM, cudaGetErrorString(e));
-        return false;
-    }
-#endif
-    return true;
-}
-
 CrackResult cuda_crack(const Target& t, const Mask& m,
                        uint64_t skip, uint64_t count, int device_id)
 {
@@ -175,7 +145,6 @@ CrackResult cuda_crack(const Target& t, const Mask& m,
     const uint32_t n0 = cs_len[0];
     const uint32_t cs0_off = cs_off[0];
 
-    if (!prep_launch()) { out.error = true; return out; }
     upload_tables();
     cudaMemcpyToSymbol(c_salt, t.salt, 8);
     cudaMemcpyToSymbol(c_data, t.data, 32);
@@ -202,7 +171,7 @@ CrackResult cuda_crack(const Target& t, const Mask& m,
 
     for (uint64_t done = 0; done < n_base; done += BASE_CHUNK) {
         const uint64_t this_bases = std::min<uint64_t>(BASE_CHUNK, n_base - done);
-        crack_kernel<<<grid, block, MB_DYN_SMEM>>>(base_begin + done, this_bases);
+        crack_kernel<<<grid, block>>>(base_begin + done, this_bases);
         err = cudaGetLastError();       // catches launch-config failures immediately
         if (err != cudaSuccess) { fprintf(stderr, "kernel launch: %s\n", cudaGetErrorString(err)); out.error = true; break; }
         err = cudaDeviceSynchronize();  // catches faults during execution
@@ -235,9 +204,7 @@ double cuda_benchmark(int device_id, uint64_t target_candidates)
     err = cudaGetDeviceProperties(&prop, device_id);
     if (err != cudaSuccess) { fprintf(stderr, "cudaGetDeviceProperties: %s\n", cudaGetErrorString(err)); return -1.0; }
     printf("device: %s  sm_%d%d  SMs=%d\n", prop.name, prop.major, prop.minor, prop.multiProcessorCount);
-    printf("config: MB_THREADS=%d  minBlocks=%d  AESKEYS_mode=%d  dyn_smem=%zu B\n",
-           MB_THREADS, MB_MINBLOCKS, MB_AES_KEYS_MODE, (size_t)MB_DYN_SMEM);
-    if (!prep_launch()) return -1.0;
+    printf("config: MB_THREADS=%d  __launch_bounds__ minBlocks=%d\n", MB_THREADS, MB_MINBLOCKS);
 
     // synthetic mask: L=8, a 64-symbol charset at every position (n0 = 64).
     static const char CS64[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/";
@@ -275,7 +242,7 @@ double cuda_benchmark(int device_id, uint64_t target_candidates)
     const uint64_t BASE_CHUNK = 1ull << 22;
 
     // warm-up: context creation + JIT + table staging (excluded from the timed section).
-    crack_kernel<<<grid, block, MB_DYN_SMEM>>>(0, std::min<uint64_t>(BASE_CHUNK, n_base));
+    crack_kernel<<<grid, block>>>(0, std::min<uint64_t>(BASE_CHUNK, n_base));
     err = cudaDeviceSynchronize();
     if (err != cudaSuccess) { fprintf(stderr, "warm-up kernel: %s\n", cudaGetErrorString(err)); return -1.0; }
     cudaMemcpyToSymbol(d_res, &init, sizeof(init));             // re-arm (warm-up left it 0 anyway)
@@ -283,7 +250,7 @@ double cuda_benchmark(int device_id, uint64_t target_candidates)
     cudaEvent_t ev0, ev1; cudaEventCreate(&ev0); cudaEventCreate(&ev1);
     cudaEventRecord(ev0);
     for (uint64_t done = 0; done < n_base; done += BASE_CHUNK)
-        crack_kernel<<<grid, block, MB_DYN_SMEM>>>(done, std::min<uint64_t>(BASE_CHUNK, n_base - done));
+        crack_kernel<<<grid, block>>>(done, std::min<uint64_t>(BASE_CHUNK, n_base - done));
     cudaEventRecord(ev1);
     err = cudaEventSynchronize(ev1);
     if (err != cudaSuccess) { fprintf(stderr, "benchmark kernel: %s\n", cudaGetErrorString(err)); return -1.0; }

@@ -415,10 +415,23 @@ multibit/
 
   **Result: the kernel is register/spill-bound, not occupancy-bound.** Raising occupancy only buys `dk[60]`
   spills and *loses* throughput (N=1→N=3 is −26%); 12.5% occupancy already hides latency because each thread
-  carries enough independent MD5+AES work. So the shipped default is **N=1**. Open lever: at N=1 regs=232
-  (near the 255 cap) with zero spills — if AES round keys could leave the register file (shared/constant, or
-  recompute-on-the-fly) and drop regs under 128 *without* spilling, N=2 would become spill-free and could win
-  on occupancy. Untested; the `make MINBLOCKS=` knob makes re-benching a one-liner.
+  carries enough independent MD5+AES work. So the shipped default is **N=1**.
+
+  **Tried and rejected — relocating the AES key schedule (measured on 5090, then reverted):** to test the
+  "get regs under 128 → spill-free N=2" idea, the AES-256 decryption schedule was moved out of registers
+  three ways. None helped; `dk[60]` in registers stayed fastest:
+
+  | AES key storage | registers | GH/s |
+  |---|---|---|
+  | **registers** (`dk[60]`, shipped) | 232 | **5.75** |
+  | in-place expand (single array, no `rk[60]` scratch) | 255 | 3.77 (−34%) |
+  | per-thread dynamic shared (stride-61, conflict-free) | 204 + 62 KB smem | 5.41 (−6%) |
+
+  Why it can't work: only ~30 of the 232 registers are the schedule — the rest is MD5 buffers, the
+  second-block decrypt, the verify logic, and the amplifier loop. Even fully in shared, regs only fell to
+  204 (still 1 block/SM), so there's no occupancy gain to offset the added access latency. The in-place
+  variant was *worse* — it pinned ptxas at the 255-reg cap and wrecked scheduling. Register/occupancy is not
+  improvable by key-storage tricks; a real gain would need to shrink the *other* live state.
 - **Phase 7 — Hardening (optional).** Multi-GPU, multiple wallets in one pass, mask files / `?d?l?u?s`
   built-ins, `.hcmask` compatibility, keyspace distribution across machines.
 

@@ -6,6 +6,7 @@
 #include <string>
 #include "pipeline_ref.h"
 #include "mask.h"
+#include "aes.cuh"      // aes256_expand_dec / _inplace are host-callable (MB_AES_HD)
 
 using namespace mb;
 
@@ -76,6 +77,24 @@ int main() {
                    (unsigned long long)found, m.length(), (const char*)pw, wallet_name(fk));
             if (memcmp(pw, "hashcat", 7) != 0) { printf("[FAIL] recovered pw != hashcat\n"); failures++; }
         }
+    }
+
+    // ---- 5. AES key schedule: in-place expand == reference expand (used by AESKEYS=inplace|shared) ----
+    {
+        AesTd tb; aes_build_tables(tb);
+        uint32_t seed = 0x12345678u;
+        auto rnd = [&]() { seed = seed * 1664525u + 1013904223u; return seed; };
+        int mism = 0;
+        for (int trial = 0; trial < 20000; trial++) {
+            uint8_t key[32];
+            for (int i = 0; i < 32; i++) key[i] = (uint8_t)(rnd() >> 24);
+            uint32_t a[60], b[60];
+            aes256_expand_dec(key, a, tb.sbox, tb.Td0, tb.Td1, tb.Td2, tb.Td3);
+            aes256_expand_dec_inplace(key, b, tb.sbox, tb.Td0, tb.Td1, tb.Td2, tb.Td3);
+            if (memcmp(a, b, sizeof(a)) != 0) mism++;
+        }
+        if (mism) { printf("[FAIL] in-place AES schedule != reference (%d/20000)\n", mism); failures++; }
+        else printf("[ ok ] AES in-place key schedule == reference (20000 random keys)\n");
     }
 
     printf(failures ? "\nRESULT: %d FAILURE(S)\n" : "\nRESULT: ALL PASS\n", failures);

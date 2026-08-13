@@ -10,12 +10,21 @@
 #include "md5.cuh"
 #include "aes.cuh"
 
+// AES key-schedule storage strategy (build knob: make AESKEYS=regs|inplace|shared):
+//   0 = regs    : local dk[60] via aes256_expand_dec (default; +rk[60] scratch)
+//   1 = inplace : local dk[60] via in-place expand (no scratch -> fewer registers)
+//   2 = shared  : dk[60] lives in a per-thread dynamic-shared slab (kernel sets tb.sched)
+#ifndef MB_AES_KEYS_MODE
+#define MB_AES_KEYS_MODE 0
+#endif
+
 namespace mb {
 
 // Shared-memory AES table pointers, bundled to keep signatures short.
 struct AesShared {
     const uint32_t *Td0, *Td1, *Td2, *Td3;
     const uint8_t  *sbox, *isbox;
+    uint32_t       *sched;   // AESKEYS=shared: this thread's 60-word schedule slab; else unused
 };
 
 // Given key1 (16 bytes) already computed, finish the pipeline. Returns WalletKind.
@@ -32,8 +41,16 @@ __device__ inline int dev_finish_from_key1(const uint8_t d1[16],
     #pragma unroll
     for (int i = 0; i < 16; i++) { key[i] = d1[i]; key[16+i] = d2[i]; }
 
-    uint32_t dk[60];
+#if MB_AES_KEYS_MODE == 2
+    uint32_t* dk = tb.sched;                                                       // shared slab
+    aes256_expand_dec_inplace(key, dk, tb.sbox, tb.Td0, tb.Td1, tb.Td2, tb.Td3);
+#elif MB_AES_KEYS_MODE == 1
+    uint32_t dk[60];                                                               // registers, no scratch
+    aes256_expand_dec_inplace(key, dk, tb.sbox, tb.Td0, tb.Td1, tb.Td2, tb.Td3);
+#else
+    uint32_t dk[60];                                                               // registers (default)
     aes256_expand_dec(key, dk, tb.sbox, tb.Td0, tb.Td1, tb.Td2, tb.Td3);
+#endif
 
     uint8_t p0[16];
     aes256_decrypt_tt(dk, data, p0, tb.Td0, tb.Td1, tb.Td2, tb.Td3, tb.isbox);

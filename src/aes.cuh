@@ -98,6 +98,37 @@ MB_AES_HD inline void aes256_expand_dec(const uint8_t key[32], uint32_t dk[60],
     }
 }
 
+// Same schedule as aes256_expand_dec, computed IN PLACE in dk[60] with no second 60-word
+// scratch array (the caller's dk doubles as the forward-schedule buffer). `dk` may point at
+// registers/local OR shared memory (per-thread slab) -- used by the AESKEYS=inplace|shared
+// builds to cut register pressure. Produces byte-identical dk (verified in selftest.cpp).
+MB_AES_HD inline void aes256_expand_dec_inplace(const uint8_t key[32], uint32_t* dk,
+                                                const uint8_t* S,
+                                                const uint32_t* Td0, const uint32_t* Td1,
+                                                const uint32_t* Td2, const uint32_t* Td3)
+{
+    const uint32_t Rcon[7] = {0x01000000,0x02000000,0x04000000,0x08000000,0x10000000,0x20000000,0x40000000};
+    for (int i = 0; i < 8; i++) dk[i] = aes_getu32_be(key + 4*i);
+    for (int i = 8; i < 60; i++) {
+        uint32_t t = dk[i-1];
+        if ((i & 7) == 0)      t = aes_subword((t<<8)|(t>>24), S) ^ Rcon[i/8 - 1]; // RotWord+SubWord
+        else if ((i & 7) == 4) t = aes_subword(t, S);
+        dk[i] = dk[i-8] ^ t;
+    }
+    // reverse the 15 round-key groups in place (group g <-> group 14-g; group 7 is its own mirror)
+    for (int g = 0; g < 7; g++) {
+        const int a = 4*g, b = 4*(14 - g);
+        for (int j = 0; j < 4; j++) { uint32_t tmp = dk[a+j]; dk[a+j] = dk[b+j]; dk[b+j] = tmp; }
+    }
+    // InvMixColumns on the middle rounds 1..13 (S cancels the inv-S baked into Td => pure IMC)
+    for (int r = 1; r <= 13; r++) {
+        for (int j = 0; j < 4; j++) {
+            uint32_t w = dk[4*r + j];
+            dk[4*r + j] = Td0[S[(w>>24)&0xff]] ^ Td1[S[(w>>16)&0xff]] ^ Td2[S[(w>>8)&0xff]] ^ Td3[S[w&0xff]];
+        }
+    }
+}
+
 // AES-256 single-block decrypt (ECB). Nr=14.
 MB_AES_HD inline void aes256_decrypt_tt(const uint32_t dk[60], const uint8_t in[16], uint8_t out[16],
                                         const uint32_t* Td0, const uint32_t* Td1,

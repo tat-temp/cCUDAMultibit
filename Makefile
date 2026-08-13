@@ -51,7 +51,14 @@ NATIVE_GENCODE := -gencode arch=compute_$(GPU_ARCH),code=sm_$(GPU_ARCH)
 # 3 = heavy spills. Changing it needs a rebuild: make clean && make MINBLOCKS=2 && ./mbcrack --benchmark
 MINBLOCKS  ?= 1
 
-NVCC_FLAGS := -O3 -use_fast_math --ptxas-options=-O3 $(GENCODE) -DUSE_CUDA -DMB_MINBLOCKS=$(MINBLOCKS) -Isrc
+# AES key-schedule storage (experiment; see pipeline.cuh):
+#   regs (default) = local dk[60]   | inplace = local, no scratch (fewer regs)
+#   shared         = dk[60] in per-thread dynamic shared memory
+# A/B: make clean && make AESKEYS=inplace && ./mbcrack --benchmark
+AESKEYS      ?= regs
+AESKEYS_MODE := $(if $(filter shared,$(AESKEYS)),2,$(if $(filter inplace,$(AESKEYS)),1,0))
+
+NVCC_FLAGS := -O3 -use_fast_math --ptxas-options=-O3 $(GENCODE) -DUSE_CUDA -DMB_MINBLOCKS=$(MINBLOCKS) -DMB_AES_KEYS_MODE=$(AESKEYS_MODE) -Isrc
 CXXFLAGS   := -std=c++17 -Xcompiler -pthread -ccbin $(HOSTCXX)
 LDFLAGS    := -cudart=static -Xcompiler -pthread
 
@@ -94,7 +101,8 @@ HOT_KERNEL  := crack_kernel
 REG_CEILING := $(shell echo $$((256 / $(MINBLOCKS))))   # 65536/(256*MINBLOCKS): tracks MINBLOCKS
 GATE_LOG    := ptxas-gate.log
 PTXAS_V_BUILD = $(NVCC) -O3 -use_fast_math --ptxas-options=-O3 $(NATIVE_GENCODE) $(CXXFLAGS) \
-                -DUSE_CUDA -DMB_MINBLOCKS=$(MINBLOCKS) -Isrc -Xptxas -v -c $(SRC_DEV) -o kernel-ptxinfo.o
+                -DUSE_CUDA -DMB_MINBLOCKS=$(MINBLOCKS) -DMB_AES_KEYS_MODE=$(AESKEYS_MODE) -Isrc \
+                -Xptxas -v -c $(SRC_DEV) -o kernel-ptxinfo.o
 
 ptxinfo: $(SRC_DEV) $(HDRS)
 	$(PTXAS_V_BUILD)

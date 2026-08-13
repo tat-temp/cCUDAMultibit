@@ -401,8 +401,9 @@ multibit/
   676-candidate two-axis mask, 0 mismatches). **Toolchain-validated:** real `nvcc` (CUDA 13.0.88) compiles
   `kernel.cu` + `main.cpp` and links `mbcrack` for `sm_120` (static cudart, `sm_120` cubin confirmed via
   `cuobjdump -lelf`). `make gate` surfaces the ptxas register/spill numbers; `./mbcrack --benchmark` reports
-  GH/s. **Benchmarked on hardware (below).** Remaining: bank-conflict check, and whether AES round keys can
-  leave the register file (see note) → **Gate:** ≥ hashcat m22500 on the same 5090.
+  GH/s. **Benchmarked on hardware (below) — Gate ✅ MET: ~7.68 GH/s vs hashcat's 7.22 (+6%)** after the
+  hashcat-grade rewrite (Steps 1–4 table below). The "can AES round keys leave the register file" question is
+  settled: no — keeping `dk[60]` in registers is fastest; the real wins were killing local-memory traffic.
 
   **`__launch_bounds__(256,N)` sweep — measured on a real RTX 5090 (sm_120, 170 SMs), CUDA 13,
   `./mbcrack --benchmark` (mask 8×64, 2e9 guesses):**
@@ -432,6 +433,36 @@ multibit/
   204 (still 1 block/SM), so there's no occupancy gain to offset the added access latency. The in-place
   variant was *worse* — it pinned ptxas at the 255-reg cap and wrecked scheduling. Register/occupancy is not
   improvable by key-storage tricks; a real gain would need to shrink the *other* live state.
+
+  **hashcat-grade rewrite (the KDF/storage glue) — measured on the same 5090, all shipped:** with occupancy
+  proven a dead end (above), the remaining gap to hashcat (7.22 GH/s) turned out to live entirely in
+  per-candidate *local-memory traffic* and dead work, not registers. Ordered steps, each landed only after a
+  clean back-to-back A/B (`--benchmark`, 3 runs/side) plus a bit-identical self-test:
+
+  | step | change | frame | reg | spill | **GH/s** | vs hashcat |
+  |---|---|---|---|---|---|---|
+  | baseline (Phase 6) | double-buffered schedule (`rk[60]`+`dk[60]`) | 304 B | 232 | 0 | 5.75 | 80% |
+  | **1** | AES schedule single **in-place + fully `#pragma unroll`'d** (kill `rk[60]`) | 96 B | 246 | 0 | **~7.43** | 103% |
+  | **2** | word-oriented MD5 assembly (kill `uint8_t msg[64]`) | 32 B | 255 | 0 | **~7.49** | 104% |
+  | **3** | AES first-byte-only reject fast path (skip dead final round on ~253/256) | 32 B | 255 | 0 | **~7.68** | **106%** |
+  | 4 | drop `key[32]` staging, feed digest halves to schedule | 32 B | 255 | 0 | 7.68 | — |
+
+  **Result: 5.75 → ~7.68 GH/s (+34%), passing hashcat by ~6%.** The lesson threaded through all three wins:
+  the kernel was bound by **per-candidate local-memory traffic** (the `rk[60]` / `msg[64]` local arrays
+  reloaded every guess) and **dead reject-path work** — *not* register count or occupancy.
+  - **Step 1 is the swing change.** The earlier "in-place = 3.77 GH/s" failure (table above) was purely the
+    *missing* `#pragma unroll`: without compile-time-constant indices `dk` fell to local memory. Force-unrolled,
+    the single in-place schedule drops the 240 B `rk[]` array + its per-candidate traffic → +29% in one change.
+  - **Step 4 was a proven no-op and reverted.** `key[32]` was never in the stack frame, so ptxas had already
+    fused it into the schedule reads; the halves-fed variant compiled to **bit-identical SASS** (0 of 4096
+    instructions differ). Recorded here so it isn't re-attempted.
+  - **Self-test hardening:** added an exhaustive word-MD5 KAT (`d_md5` vs reference over all lengths/shapes),
+    a byte0-vs-full-decrypt check, and — via `cuda_stub.h` — a host run of the *exact* device pipeline
+    (`dev_try_password`) against `try_password`, so the KDF/AES glue is validated bit-for-bit with no GPU.
+
+  What's left is the algorithmic floor: **3× MD5 + 1× AES-256 expand + 1× block decrypt per candidate**, which
+  hashcat pays too. No structural lever remains without changing m22500 itself. Codegen is pinned at 255 reg /
+  0 spill / 12.5% occ (the AES `dk[60]` sets the floor); the 128-reg / 25%-occ path spills and is slower (above).
 - **Phase 7 — Hardening (optional).** Multi-GPU, multiple wallets in one pass, mask files / `?d?l?u?s`
   built-ins, `.hcmask` compatibility, keyspace distribution across machines.
 

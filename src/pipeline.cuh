@@ -35,14 +35,21 @@ __device__ inline int dev_finish_from_key1(const uint8_t d1[16],
     uint32_t dk[60];
     aes256_expand_dec(key, dk, tb.sbox, tb.Td0, tb.Td1, tb.Td2, tb.Td3);
 
+    // Diffuse the first ciphertext block through the 13 middle rounds, then reject on the CBC
+    // first plaintext byte alone (~253/256 candidates die here) BEFORE computing the full final
+    // round + 16-byte IV XOR. b == p0[0] exactly (final byte0 ^ iv[0]).
+    uint32_t st0, st1, st2, st3;
+    aes256_decrypt_rounds(dk, data, st0, st1, st2, st3, tb.Td0, tb.Td1, tb.Td2, tb.Td3);
+    uint8_t b = aes256_decrypt_byte0(dk, st0, tb.isbox) ^ iv[0];
+
+    if (!first_byte_ok(b)) return WK_NONE;
+
+    // Survivor: complete the block (final round + CBC IV XOR).
     uint8_t p0[16];
-    aes256_decrypt_tt(dk, data, p0, tb.Td0, tb.Td1, tb.Td2, tb.Td3, tb.isbox);
+    aes256_decrypt_final(dk, st0, st1, st2, st3, p0, tb.isbox);
     #pragma unroll
     for (int i = 0; i < 16; i++) p0[i] ^= iv[i];
 
-    if (!first_byte_ok(p0[0])) return WK_NONE;
-
-    uint8_t b = p0[0];
     if (b==0x4b || b==0x4c || b==0x51 || b==0x35) {
         if (!is_valid_base58_16(p0)) return WK_NONE;
         uint8_t p1[16];

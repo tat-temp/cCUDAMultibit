@@ -8,6 +8,8 @@
 #include "mask.h"
 #include "aes.cuh"      // T-table AES (aes256_expand_dec / aes256_decrypt_tt) — host-callable via MB_AES_HD
 #include "md5.cuh"      // device MD5 (d_md5 / d_md5_buildM) — host-callable via MB_MD5_HD
+#include "cuda_stub.h"  // map __device__/etc. to no-ops so the real device pipeline runs on host
+#include "pipeline.cuh" // device per-candidate pipeline (dev_try_password) — validated vs reference
 
 using namespace mb;
 
@@ -97,6 +99,10 @@ int main() {
             AES256 ref; ref.expand_key(key);
             uint8_t exp[16]; ref.decrypt_block(ct, exp);
             if (memcmp(got, exp, 16) != 0) mism++;
+            // Step 3 fast path: 13 middle rounds + byte0 must equal the full decrypt's byte 0.
+            uint32_t st0, st1, st2, st3;
+            aes256_decrypt_rounds(dk, ct, st0, st1, st2, st3, tb.Td0, tb.Td1, tb.Td2, tb.Td3);
+            if (aes256_decrypt_byte0(dk, st0, tb.isbox) != got[0]) mism++;
         }
         if (mism) { printf("[FAIL] T-table AES decrypt != reference (%d/50000)\n", mism); failures++; }
         else printf("[ ok ] T-table AES-256 decrypt == reference (50000 random vectors)\n");
@@ -138,6 +144,35 @@ int main() {
 
         if (mism) { printf("[FAIL] word MD5 assembly != reference (%d/%d vectors)\n", mism, ntest); failures++; }
         else printf("[ ok ] word MD5 assembly == reference (%d vectors: shapes A/B + edges + random)\n", ntest);
+    }
+
+    // ---- 7. Device per-candidate pipeline (dev_try_password) == CPU reference (try_password) ----
+    // Runs the EXACT device glue on host (via cuda_stub.h): MD5 KDF, AES expand + first-block
+    // decrypt, the Step-3 first-byte fast-path reject, and the wallet-structure predicates. The
+    // one accept ('hashcat') exercises the full/survivor path; the rest exercise the fast reject.
+    {
+        AesTd tbl; aes_build_tables(tbl);
+        AesShared sh; sh.Td0=tbl.Td0; sh.Td1=tbl.Td1; sh.Td2=tbl.Td2; sh.Td3=tbl.Td3;
+        sh.sbox=tbl.sbox; sh.isbox=tbl.isbox;
+        int mism = 0, ntest = 0;
+        auto cmp = [&](const uint8_t* pw, int L) {
+            int        dev = dev_try_password(t.salt, t.data, pw, L, sh);
+            WalletKind ref = try_password(t, pw, L);
+            ntest++;
+            if (dev != (int)ref) { mism++; printf("   mismatch: pw len=%d dev=%d ref=%d\n", L, dev, (int)ref); }
+        };
+        const char* words[] = {"hashcat","wrongpw","a","hashca","hashcat1","password","","zzzzzzzz","HASHCAT","hashcaT"};
+        for (const char* w : words) cmp((const uint8_t*)w, (int)strlen(w));
+        // brute a mask slice so many candidates flow through the fast reject path
+        {
+            Mask m; m.parse("hashca?l"); uint8_t pwb[8];
+            for (uint64_t i = 0; i < m.keyspace(); i++) {
+                m.index_to_password(i, pwb);
+                cmp(pwb, m.length());
+            }
+        }
+        if (mism) { printf("[FAIL] device pipeline != reference (%d/%d)\n", mism, ntest); failures++; }
+        else printf("[ ok ] device pipeline == reference (%d passwords: accept + fast-path rejects)\n", ntest);
     }
 
     printf(failures ? "\nRESULT: %d FAILURE(S)\n" : "\nRESULT: ALL PASS\n", failures);

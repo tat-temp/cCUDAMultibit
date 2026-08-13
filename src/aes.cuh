@@ -108,15 +108,22 @@ MB_AES_HD inline void aes256_expand_dec(const uint8_t key[32], uint32_t dk[60],
     }
 }
 
-// AES-256 single-block decrypt (ECB). Nr=14.
-MB_AES_HD inline void aes256_decrypt_tt(const uint32_t dk[60], const uint8_t in[16], uint8_t out[16],
-                                        const uint32_t* Td0, const uint32_t* Td1,
-                                        const uint32_t* Td2, const uint32_t* Td3, const uint8_t* IS)
+// AES-256 single-block decrypt (ECB), Nr=14, split so callers can reject on the first plaintext
+// byte without paying for the full final round. The 13 T-table "middle" rounds diffuse the state
+// and MUST run in full (output byte 0 depends on all four state words via InvMixColumns), but the
+// final inverse-SubBytes round's other 15 bytes are dead weight for the ~253/256 candidates that
+// first_byte_ok rejects. See src/pipeline.cuh for the fast-path reject.
+
+// 13 middle rounds -> diffused state words (pre-final-round).
+MB_AES_HD inline void aes256_decrypt_rounds(const uint32_t dk[60], const uint8_t in[16],
+                                            uint32_t& s0, uint32_t& s1, uint32_t& s2, uint32_t& s3,
+                                            const uint32_t* Td0, const uint32_t* Td1,
+                                            const uint32_t* Td2, const uint32_t* Td3)
 {
-    uint32_t s0 = aes_getu32_be(in+0) ^ dk[0];
-    uint32_t s1 = aes_getu32_be(in+4) ^ dk[1];
-    uint32_t s2 = aes_getu32_be(in+8) ^ dk[2];
-    uint32_t s3 = aes_getu32_be(in+12) ^ dk[3];
+    s0 = aes_getu32_be(in+0) ^ dk[0];
+    s1 = aes_getu32_be(in+4) ^ dk[1];
+    s2 = aes_getu32_be(in+8) ^ dk[2];
+    s3 = aes_getu32_be(in+12) ^ dk[3];
     #pragma unroll
     for (int r = 1; r <= 13; r++) {
         uint32_t t0 = Td0[s0>>24] ^ Td1[(s3>>16)&0xff] ^ Td2[(s2>>8)&0xff] ^ Td3[s1&0xff] ^ dk[4*r+0];
@@ -125,7 +132,20 @@ MB_AES_HD inline void aes256_decrypt_tt(const uint32_t dk[60], const uint8_t in[
         uint32_t t3 = Td0[s3>>24] ^ Td1[(s2>>16)&0xff] ^ Td2[(s1>>8)&0xff] ^ Td3[s0&0xff] ^ dk[4*r+3];
         s0=t0; s1=t1; s2=t2; s3=t3;
     }
-    // last round: inverse S-box only, no MixColumns
+}
+
+// First plaintext byte only: top byte of (o0 ^ dk[56]) = IS[s0>>24] ^ (dk[56]>>24). One table
+// lookup — enough to run first_byte_ok before committing to the full final round.
+MB_AES_HD inline uint8_t aes256_decrypt_byte0(const uint32_t dk[60], uint32_t s0, const uint8_t* IS)
+{
+    return (uint8_t)(IS[s0>>24] ^ (uint8_t)(dk[56]>>24));
+}
+
+// Final round: inverse S-box only (no MixColumns) + AddRoundKey -> the 16 plaintext bytes.
+MB_AES_HD inline void aes256_decrypt_final(const uint32_t dk[60],
+                                           uint32_t s0, uint32_t s1, uint32_t s2, uint32_t s3,
+                                           uint8_t out[16], const uint8_t* IS)
+{
     uint32_t o0 = ((uint32_t)IS[s0>>24]<<24)|((uint32_t)IS[(s3>>16)&0xff]<<16)|((uint32_t)IS[(s2>>8)&0xff]<<8)|IS[s1&0xff];
     uint32_t o1 = ((uint32_t)IS[s1>>24]<<24)|((uint32_t)IS[(s0>>16)&0xff]<<16)|((uint32_t)IS[(s3>>8)&0xff]<<8)|IS[s2&0xff];
     uint32_t o2 = ((uint32_t)IS[s2>>24]<<24)|((uint32_t)IS[(s1>>16)&0xff]<<16)|((uint32_t)IS[(s0>>8)&0xff]<<8)|IS[s3&0xff];
@@ -134,6 +154,16 @@ MB_AES_HD inline void aes256_decrypt_tt(const uint32_t dk[60], const uint8_t in[
     aes_putu32_be(out+4,  o1 ^ dk[57]);
     aes_putu32_be(out+8,  o2 ^ dk[58]);
     aes_putu32_be(out+12, o3 ^ dk[59]);
+}
+
+// Full single-block decrypt (unchanged behavior) = middle rounds + final round.
+MB_AES_HD inline void aes256_decrypt_tt(const uint32_t dk[60], const uint8_t in[16], uint8_t out[16],
+                                        const uint32_t* Td0, const uint32_t* Td1,
+                                        const uint32_t* Td2, const uint32_t* Td3, const uint8_t* IS)
+{
+    uint32_t s0, s1, s2, s3;
+    aes256_decrypt_rounds(dk, in, s0, s1, s2, s3, Td0, Td1, Td2, Td3);
+    aes256_decrypt_final(dk, s0, s1, s2, s3, out, IS);
 }
 
 } // namespace mb

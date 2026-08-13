@@ -6,6 +6,7 @@
 #include <string>
 #include "pipeline_ref.h"
 #include "mask.h"
+#include "aes.cuh"      // T-table AES (aes256_expand_dec / aes256_decrypt_tt) — host-callable via MB_AES_HD
 
 using namespace mb;
 
@@ -76,6 +77,28 @@ int main() {
                    (unsigned long long)found, m.length(), (const char*)pw, wallet_name(fk));
             if (memcmp(pw, "hashcat", 7) != 0) { printf("[FAIL] recovered pw != hashcat\n"); failures++; }
         }
+    }
+
+    // ---- 5. T-table AES-256 (in-place key schedule) == byte-oriented reference, many vectors ----
+    {
+        AesTd tb; aes_build_tables(tb);
+        uint32_t seed = 0xC0FFEEu;
+        auto rnd = [&]() { seed = seed * 1664525u + 1013904223u; return seed; };
+        int mism = 0;
+        for (int trial = 0; trial < 50000; trial++) {
+            uint8_t key[32], ct[16];
+            for (int i = 0; i < 32; i++) key[i] = (uint8_t)(rnd() >> 24);
+            for (int i = 0; i < 16; i++) ct[i]  = (uint8_t)(rnd() >> 24);
+            uint32_t dk[60];
+            aes256_expand_dec(key, dk, tb.sbox, tb.Td0, tb.Td1, tb.Td2, tb.Td3);
+            uint8_t got[16];
+            aes256_decrypt_tt(dk, ct, got, tb.Td0, tb.Td1, tb.Td2, tb.Td3, tb.isbox);
+            AES256 ref; ref.expand_key(key);
+            uint8_t exp[16]; ref.decrypt_block(ct, exp);
+            if (memcmp(got, exp, 16) != 0) mism++;
+        }
+        if (mism) { printf("[FAIL] T-table AES decrypt != reference (%d/50000)\n", mism); failures++; }
+        else printf("[ ok ] T-table AES-256 decrypt == reference (50000 random vectors)\n");
     }
 
     printf(failures ? "\nRESULT: %d FAILURE(S)\n" : "\nRESULT: ALL PASS\n", failures);

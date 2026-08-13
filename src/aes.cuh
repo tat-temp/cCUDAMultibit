@@ -77,20 +77,30 @@ MB_AES_HD inline void aes256_expand_dec(const uint8_t key[32], uint32_t dk[60],
                                         const uint32_t* Td2, const uint32_t* Td3)
 {
     const uint32_t Rcon[7] = {0x01000000,0x02000000,0x04000000,0x08000000,0x10000000,0x20000000,0x40000000};
-    uint32_t rk[60];
-    for (int i = 0; i < 8; i++) rk[i] = aes_getu32_be(key + 4*i);
+    // Single-buffer, in-place (hashcat aes256_ExpandKey/InvertKey style): expand the forward schedule
+    // directly into dk, with NO separate rk[60] scratch. Fully unrolled so every index is a compile-time
+    // constant -> dk register-promotes and the 240 B rk[] local array + reverse-copy disappear.
+    #pragma unroll
+    for (int i = 0; i < 8; i++) dk[i] = aes_getu32_be(key + 4*i);
+    #pragma unroll
     for (int i = 8; i < 60; i++) {
-        uint32_t t = rk[i-1];
+        uint32_t t = dk[i-1];
         if ((i & 7) == 0)      t = aes_subword((t<<8)|(t>>24), S) ^ Rcon[i/8 - 1]; // RotWord+SubWord
         else if ((i & 7) == 4) t = aes_subword(t, S);
-        rk[i] = rk[i-8] ^ t;
+        dk[i] = dk[i-8] ^ t;
     }
-    // reverse round-key order (Nr=14 -> 15 blocks of 4 words)
-    for (int i = 0; i < 60; i += 4) {
-        dk[i+0] = rk[56 - i]; dk[i+1] = rk[57 - i]; dk[i+2] = rk[58 - i]; dk[i+3] = rk[59 - i];
+    // reverse the 15 round-key groups IN PLACE (group b <-> group 14-b; group 7 is its own mirror)
+    #pragma unroll
+    for (int b = 0; b < 7; b++) {
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            uint32_t tmp = dk[4*b + j]; dk[4*b + j] = dk[4*(14-b) + j]; dk[4*(14-b) + j] = tmp;
+        }
     }
     // InvMixColumns on the middle rounds 1..13 (S cancels the inv-S baked into Td => pure IMC)
+    #pragma unroll
     for (int r = 1; r <= 13; r++) {
+        #pragma unroll
         for (int j = 0; j < 4; j++) {
             uint32_t w = dk[4*r + j];
             dk[4*r + j] = Td0[S[(w>>24)&0xff]] ^ Td1[S[(w>>16)&0xff]] ^ Td2[S[(w>>8)&0xff]] ^ Td3[S[w&0xff]];

@@ -401,9 +401,11 @@ multibit/
   676-candidate two-axis mask, 0 mismatches). **Toolchain-validated:** real `nvcc` (CUDA 13.0.88) compiles
   `kernel.cu` + `main.cpp` and links `mbcrack` for `sm_120` (static cudart, `sm_120` cubin confirmed via
   `cuobjdump -lelf`). `make gate` surfaces the ptxas register/spill numbers; `./mbcrack --benchmark` reports
-  GH/s. **Benchmarked on hardware (below) — Gate ✅ MET: ~7.68 GH/s vs hashcat's 7.22 (+6%)** after the
-  hashcat-grade rewrite (Steps 1–4 table below). The "can AES round keys leave the register file" question is
-  settled: no — keeping `dk[60]` in registers is fastest; the real wins were killing local-memory traffic.
+  GH/s. **Benchmarked on hardware (below) — Gate ✅ MET.** The hashcat-grade rewrite (Steps 1–4 table below)
+  reached ~7.68 GH/s vs hashcat's 7.22 (+6%); two further measured wins (**P1**, **P2**) then took it to
+  **~10.66 GH/s (+48% vs hashcat)** — see "Post-rewrite wins" at the end of this section. The "can AES round
+  keys leave the register file" question is settled: no — keeping `dk[60]` in registers is fastest; the real
+  wins were killing local-memory traffic, then per-candidate shared-load and integer/branch work.
 
   **`__launch_bounds__(256,N)` sweep — measured on a real RTX 5090 (sm_120, 170 SMs), CUDA 13,
   `./mbcrack --benchmark` (mask 8×64, 2e9 guesses):**
@@ -460,9 +462,37 @@ multibit/
     a byte0-vs-full-decrypt check, and — via `cuda_stub.h` — a host run of the *exact* device pipeline
     (`dev_try_password`) against `try_password`, so the KDF/AES glue is validated bit-for-bit with no GPU.
 
-  What's left is the algorithmic floor: **3× MD5 + 1× AES-256 expand + 1× block decrypt per candidate**, which
-  hashcat pays too. No structural lever remains without changing m22500 itself. Codegen is pinned at 255 reg /
-  0 spill / 12.5% occ (the AES `dk[60]` sets the floor); the 128-reg / 25%-occ path spills and is slower (above).
+  **Post-rewrite wins (P1, P2) — measured on the 5090, both shipped.** The "no structural lever remains /
+  pinned at 255 reg" conclusion drawn here turned out to be **premature**: two more register-neutral-or-favorable
+  levers cleared it, because the "register/occupancy-bound, everything else ILP-hidden" model under-weighted
+  per-candidate **shared-load** and **integer/branch** work at 1 block/SM. Each landed after a clean A/B
+  (`--benchmark`) + bit-identical self-test:
+
+  | step | change | reg | spill | **GH/s** | vs hashcat |
+  |---|---|---|---|---|---|
+  | (rewrite end) | Steps 1–4 above | 255 | 0 | 7.68 | +6% |
+  | **P1** | precomputed InvMixColumns schedule tables (`IMCk[b]=Tdk[sbox[b]]`) | **251** | 0 | **8.63** | +19% |
+  | **P2** | compile-time password length (`-DMB_FIXED_LEN=N` → `mbcrack_l7..l15`) | fewer (−29 on sm_90) | 0 | **~10.66** | **+48%** |
+
+  - **P1** collapses the decrypt key schedule's InvMixColumns pass — the single biggest reject-path shared-load
+    consumer (416 of ~676 loads/candidate, a 2-deep `sbox→Td` dependent chain) — into one lookup per state byte
+    via `IMCk[b]=Tdk[sbox[b]]` (the forward S-box cancels the inverse S-box baked into `Td`, leaving pure IMC).
+    Bit-identical by construction; +4 KB smem; register count actually *fell* 255→251. **+12.3%.**
+  - **P2** bakes the password length in at compile time (a `-DMB_FIXED_LEN=N` macro; `make` emits one binary per
+    length 7–15 plus the runtime `mbcrack`) so all three `d_md5_buildM` message assemblies constant-fold. The
+    win (**+23.6%**, far above the +1–3% estimate) came not from the ~88 dropped zero-word adds but from
+    eliminating `buildM`'s **runtime length-branch cascade evaluated per candidate for `key2` and `iv`** (both
+    computed inside the inner charset loop, unlike the hoisted `key1`), plus ~29 registers freed. Length-flat:
+    `mbcrack_l7..l15` all measure ~10.63–10.69 GH/s.
+
+  **Corrected conclusion.** Cumulative **5.75 → ~10.66 GH/s (+85%), now ~48% past hashcat.** The irreducible
+  algorithmic core is still **3× MD5 + 1× AES-256 expand + 1× block decrypt per candidate** (hashcat pays it
+  too), but "no structural lever remains" was wrong — the recurring lesson across P1+P2 is that the
+  register/occupancy-bound framing **systematically under-predicted**: at 1 block/SM the per-candidate
+  integer/branch/shared-load work *is* a live bottleneck, so cutting it at zero register cost pays. Remaining
+  candidate levers (unshipped): an `ncu` bank-conflict audit of the `Td`/`IMC` lookups, then per-warp T-table
+  replication (near-free at 1 block/SM with only 8704 B smem in use). Occupancy itself stays a dead end
+  (N=2/N=3 spill `dk[60]`, above). Codegen: runtime kernel 251 reg / 0 spill after P1; `mbcrack_l8` fewer, 0 spill.
 - **Phase 7 — Hardening (optional).** Multi-GPU, multiple wallets in one pass, mask files / `?d?l?u?s`
   built-ins, `.hcmask` compatibility, keyspace distribution across machines.
 

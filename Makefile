@@ -1,6 +1,8 @@
 # Makefile — mbcrack (MultiBit m22500 CUDA cracker), Ubuntu/Linux.
 #
-#   make            # GPU build (default) -> ./mbcrack           [needs CUDA >= 12.8]
+#   make            # GPU build (default) -> ./mbcrack + ./mbcrack_l7..l15  (10 binaries) [CUDA >= 12.8]
+#   make runtime    # just the length-agnostic ./mbcrack (skip the 9 fixed-length binaries)
+#   make mbcrack_l8 # a single fixed-length binary (P2: pw_len baked in at compile time)
 #   make cpu        # CPU-only build (g++, no CUDA) -> ./mbcrack_cpu + ./selftest
 #   make test       # build + run the CPU self-test (no GPU needed)
 #   make gate       # native-arch build with -Xptxas -v; FAIL on spill or reg-ceiling breach
@@ -19,6 +21,12 @@
 #   A/B on-device:  make clean && make THREADS=512 && ./mbcrack --benchmark   (clean: obj is cached)
 
 TARGET      := mbcrack
+# P2: fixed-length GPU binaries — one executable per compile-time password length (7..15). Each
+# mbcrack_l<N> bakes -DMB_FIXED_LEN=<N> so the MD5 KDF message words constant-fold for that length.
+# The runtime `mbcrack` above handles any length (use it for 1..6); together = 10 executables.
+FIXED_LENS    := 7 8 9 10 11 12 13 14 15
+FIXED_TARGETS := $(addprefix mbcrack_l,$(FIXED_LENS))
+FIXED_OBJS    := $(foreach L,$(FIXED_LENS),main_l$(L).o kernel_l$(L).o)
 CPU_TARGET  := mbcrack_cpu
 SRC_HOST    := src/main.cpp
 SRC_DEV     := src/kernel.cu
@@ -62,13 +70,19 @@ LDFLAGS    := -cudart=static -Xcompiler -pthread
 CPUCXX      ?= g++
 CPUFLAGS    := -O3 -std=c++17 -Isrc -pthread
 
-.PHONY: all cpu test gate ptxinfo sass resusage tools clean
+.PHONY: all runtime cpu test gate ptxinfo sass resusage tools clean
 
 # Default goal is the GPU cracker. Set explicitly so it can't be hijacked by target
 # ordering (e.g. `tools:` appearing first would otherwise become the default).
 .DEFAULT_GOAL := all
 
-all: $(TARGET)
+all: $(TARGET) $(FIXED_TARGETS)
+
+# runtime-only build (just the length-agnostic mbcrack, skip the 9 fixed binaries)
+runtime: $(TARGET)
+
+# keep the per-length objects (pattern-rule intermediates) so rebuilds don't recompile them
+.SECONDARY: $(FIXED_OBJS)
 
 tools: gen_vector
 
@@ -79,6 +93,15 @@ kernel.o: $(SRC_DEV) $(HDRS)
 	$(NVCC) $(NVCC_FLAGS) $(CXXFLAGS) -c $< -o $@
 $(TARGET): main.o kernel.o
 	$(NVCC) $(NVCC_FLAGS) $(CXXFLAGS) main.o kernel.o -o $@ $(LDFLAGS)
+
+# --- fixed-length GPU builds (P2): mbcrack_l<N> = both TUs compiled with -DMB_FIXED_LEN=<N>.
+# $* is the length stem, so `make mbcrack_l8` bakes MB_FIXED_LEN=8 into main + kernel. ---
+main_l%.o: $(SRC_HOST) $(HDRS)
+	$(NVCC) $(NVCC_FLAGS) -DMB_FIXED_LEN=$* $(CXXFLAGS) -c $(SRC_HOST) -o $@
+kernel_l%.o: $(SRC_DEV) $(HDRS)
+	$(NVCC) $(NVCC_FLAGS) -DMB_FIXED_LEN=$* $(CXXFLAGS) -c $(SRC_DEV) -o $@
+mbcrack_l%: main_l%.o kernel_l%.o
+	$(NVCC) $(NVCC_FLAGS) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
 
 # --- CPU-only build (works with no CUDA installed) ---
 cpu: $(CPU_TARGET) selftest gen_vector
@@ -96,8 +119,10 @@ test: selftest gen_vector
 HOT_KERNEL  := crack_kernel
 REG_CEILING := $(shell echo $$((65536 / ($(THREADS) * $(MINBLOCKS)))))   # tracks THREADS and MINBLOCKS
 GATE_LOG    := ptxas-gate.log
+# Pass FIXED_LEN=N to gate/ptxinfo a specific fixed-length kernel, e.g. `make gate FIXED_LEN=8`.
 PTXAS_V_BUILD = $(NVCC) -O3 -use_fast_math --ptxas-options=-O3 $(NATIVE_GENCODE) $(CXXFLAGS) \
-                -DUSE_CUDA -DMB_MINBLOCKS=$(MINBLOCKS) -DMB_THREADS=$(THREADS) -Isrc \
+                -DUSE_CUDA -DMB_MINBLOCKS=$(MINBLOCKS) -DMB_THREADS=$(THREADS) \
+                $(if $(FIXED_LEN),-DMB_FIXED_LEN=$(FIXED_LEN)) -Isrc \
                 -Xptxas -v -c $(SRC_DEV) -o kernel-ptxinfo.o
 
 ptxinfo: $(SRC_DEV) $(HDRS)
@@ -132,4 +157,4 @@ sass: $(TARGET)
 	cuobjdump -sass $(TARGET)
 
 clean:
-	rm -f $(TARGET) $(CPU_TARGET) selftest gen_vector main.o kernel.o kernel-ptxinfo.o $(GATE_LOG)
+	rm -f $(TARGET) $(FIXED_TARGETS) $(CPU_TARGET) selftest gen_vector main.o kernel.o main_l*.o kernel_l*.o kernel-ptxinfo.o $(GATE_LOG)

@@ -31,6 +31,14 @@ namespace mb {
 #define MB_MINBLOCKS 1                  // __launch_bounds__ minBlocksPerMP; build knob: make MINBLOCKS=1|2|3
 #endif                                 // default 1: measured fastest on RTX 5090 (register/spill-bound)
 
+// P2 (optional): -DMB_FIXED_LEN=N bakes the password length in at compile time so the MD5 KDF
+// message assembly constant-folds (mbcrack_l7..l15 binaries). Absent => runtime length (default).
+#ifdef MB_FIXED_LEN
+  #if (MB_FIXED_LEN) < 1 || (MB_FIXED_LEN) > MB_MAX_LEN
+    #error "MB_FIXED_LEN must be in [1, MB_MAX_LEN]"
+  #endif
+#endif
+
 // ---- constant memory: target + mask ----
 __constant__ uint8_t  c_salt[8];
 __constant__ uint8_t  c_data[32];
@@ -66,7 +74,11 @@ __global__ void crack_kernel(uint64_t base_begin, uint64_t base_count)
     AesShared tb; tb.Td0=sTd0; tb.Td1=sTd1; tb.Td2=sTd2; tb.Td3=sTd3;
     tb.IMC0=sIMC0; tb.IMC1=sIMC1; tb.IMC2=sIMC2; tb.IMC3=sIMC3; tb.sbox=sS; tb.isbox=sIS;
 
-    const int      L  = c_pw_len;
+#ifdef MB_FIXED_LEN
+    constexpr int  L  = MB_FIXED_LEN;   // P2: compile-time length -> d_md5 message words + their adds constant-fold
+#else
+    const int      L  = c_pw_len;       // runtime length (this build handles any mask length)
+#endif
     const uint32_t n0 = c_n0;
     const uint64_t stride = (uint64_t)gridDim.x * blockDim.x;
 
@@ -141,6 +153,13 @@ CrackResult cuda_crack(const Target& t, const Mask& m,
 
     const int L = m.length();
     if (L < 1 || L > MB_MAX_LEN) { fprintf(stderr, "mask length %d out of range\n", L); out.error = true; return out; }
+#ifdef MB_FIXED_LEN
+    if (L != MB_FIXED_LEN) {
+        fprintf(stderr, "this build (mbcrack_l%d) only supports mask length %d, got %d; use runtime mbcrack or mbcrack_l%d\n",
+                MB_FIXED_LEN, MB_FIXED_LEN, L, L);
+        out.error = true; return out;
+    }
+#endif
 
     // flatten per-position charsets
     std::vector<uint8_t> cs_data;
@@ -214,11 +233,20 @@ double cuda_benchmark(int device_id, uint64_t target_candidates)
     err = cudaGetDeviceProperties(&prop, device_id);
     if (err != cudaSuccess) { fprintf(stderr, "cudaGetDeviceProperties: %s\n", cudaGetErrorString(err)); return -1.0; }
     printf("device: %s  sm_%d%d  SMs=%d\n", prop.name, prop.major, prop.minor, prop.multiProcessorCount);
-    printf("config: MB_THREADS=%d  __launch_bounds__ minBlocks=%d\n", MB_THREADS, MB_MINBLOCKS);
+#ifdef MB_FIXED_LEN
+    printf("config: MB_THREADS=%d  minBlocks=%d  FIXED pw_len=%d (compile-time)\n", MB_THREADS, MB_MINBLOCKS, MB_FIXED_LEN);
+#else
+    printf("config: MB_THREADS=%d  minBlocks=%d  pw_len=runtime\n", MB_THREADS, MB_MINBLOCKS);
+#endif
 
-    // synthetic mask: L=8, a 64-symbol charset at every position (n0 = 64).
+    // synthetic mask: a 64-symbol charset at every position (n0 = 64). Length is the build's fixed
+    // pw_len if set (so each mbcrack_lN benchmarks at its own length), else L=8.
     static const char CS64[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/";
+#ifdef MB_FIXED_LEN
+    const int      L  = MB_FIXED_LEN;
+#else
     const int      L  = 8;
+#endif
     const uint32_t n0 = 64;
     std::vector<uint8_t> cs_data;
     uint32_t cs_off[MB_MAX_LEN], cs_len[MB_MAX_LEN];
@@ -272,8 +300,8 @@ double cuda_benchmark(int device_id, uint64_t target_candidates)
     const double cand = (double)n_base * (double)n0;
     const double secs = (double)ms / 1000.0;
     const double ghs  = cand / secs / 1e9;
-    printf("benchmark: mask=8x%u (n0=%u)  candidates=%.3e  kernel_time=%.4f s\n",
-           n0, n0, cand, secs);
+    printf("benchmark: mask=%dx%u (n0=%u)  candidates=%.3e  kernel_time=%.4f s\n",
+           L, n0, n0, cand, secs);
     printf("throughput: %.3f GH/s  (%.1f MH/s)\n", ghs, ghs * 1000.0);
     return ghs;
 }

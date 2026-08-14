@@ -2,3 +2,10 @@
 *.exe
 *.o
 *.obj
+# built binaries (extensionless on Linux/WSL): runtime + fixed-length (P2) + CPU/test tools
+/mbcrack
+/mbcrack_l*
+/mbcrack_cpu
+/selftest
+/gen_vector
+ptxas-gate.log

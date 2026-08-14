@@ -129,6 +129,15 @@ int main(int argc, char** argv) {
 
         Target t = parse_hash(load_hash(hash_arg));
         mask.parse(mask_str);
+#ifdef MB_FIXED_LEN
+        // Fixed-length build (mbcrack_l<N>): the compile-time-baked pw length must match the mask.
+        if (mask.length() != MB_FIXED_LEN) {
+            fprintf(stderr, "error: this build (mbcrack_l%d) only supports mask length %d; the mask has length %d.\n"
+                            "       Use the runtime 'mbcrack' or the matching 'mbcrack_l%d'.\n",
+                    MB_FIXED_LEN, MB_FIXED_LEN, mask.length(), mask.length());
+            return 2;
+        }
+#endif
         uint64_t N = mask.keyspace();
         uint64_t begin = skip;
         uint64_t end = (limit == 0) ? N : std::min<uint64_t>(N, skip + limit);

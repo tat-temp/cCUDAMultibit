@@ -148,6 +148,40 @@ MB_AES_HD inline void aes256_decrypt_rounds(const uint32_t dk[60], const uint8_t
     }
 }
 
+// ---- bank-pinned (conflict-free) T-table variant ----
+// A bank-pinned table stores entry v of a 256-entry uint32 table as a 32-wide column-major replica:
+// physical slot [v*32 + lane]. A warp's lane L then reads bank (v*32+L) mod 32 == L, i.e. every lane
+// hits its OWN bank on every gather regardless of the (iid) data byte v -> R=1.0, conflict-free.
+// This is NOT the value-preserving relayout family (bank = sigma(byte), always iid): keying the low
+// address bits off the LANE, not the entry, is what escapes the balls-in-bins floor. Cost: 32x storage
+// per table. Only Td0 is pinned (32 KB); Td1..3 come from register rotates via the AES identity
+// Td_j[x] == ror(Td0[x], 8j) (see aes_build_tables: Td1=ror8, Td2=ror16, Td3=ror24). Bit-identical.
+MB_AES_HD inline uint32_t mb_ror8 (uint32_t x) { return (x>>8) |(x<<24); }
+MB_AES_HD inline uint32_t mb_ror16(uint32_t x) { return (x>>16)|(x<<16); }
+MB_AES_HD inline uint32_t mb_ror24(uint32_t x) { return (x>>24)|(x<<8);  }
+// gather entry v (already 0..255) from a bank-pinned table for this lane.
+MB_AES_HD inline uint32_t mb_pin(const uint32_t* Tp, uint32_t v, uint32_t lane) { return Tp[v*32u + lane]; }
+
+// 13 middle rounds using a single bank-pinned Td0 replica (Td1..3 = register rotates). lane = warp
+// lane id (threadIdx.x & 31) on device; any value 0..31 on host (all columns hold the same table).
+MB_AES_HD inline void aes256_decrypt_rounds_pin(const uint32_t dk[60], const uint8_t in[16],
+                                                uint32_t& s0, uint32_t& s1, uint32_t& s2, uint32_t& s3,
+                                                const uint32_t* Td0p, uint32_t lane)
+{
+    s0 = aes_getu32_be(in+0) ^ dk[0];
+    s1 = aes_getu32_be(in+4) ^ dk[1];
+    s2 = aes_getu32_be(in+8) ^ dk[2];
+    s3 = aes_getu32_be(in+12) ^ dk[3];
+    #pragma unroll
+    for (int r = 1; r <= 13; r++) {
+        uint32_t t0 = mb_pin(Td0p,s0>>24,lane) ^ mb_ror8(mb_pin(Td0p,(s3>>16)&0xff,lane)) ^ mb_ror16(mb_pin(Td0p,(s2>>8)&0xff,lane)) ^ mb_ror24(mb_pin(Td0p,s1&0xff,lane)) ^ dk[4*r+0];
+        uint32_t t1 = mb_pin(Td0p,s1>>24,lane) ^ mb_ror8(mb_pin(Td0p,(s0>>16)&0xff,lane)) ^ mb_ror16(mb_pin(Td0p,(s3>>8)&0xff,lane)) ^ mb_ror24(mb_pin(Td0p,s2&0xff,lane)) ^ dk[4*r+1];
+        uint32_t t2 = mb_pin(Td0p,s2>>24,lane) ^ mb_ror8(mb_pin(Td0p,(s1>>16)&0xff,lane)) ^ mb_ror16(mb_pin(Td0p,(s0>>8)&0xff,lane)) ^ mb_ror24(mb_pin(Td0p,s3&0xff,lane)) ^ dk[4*r+2];
+        uint32_t t3 = mb_pin(Td0p,s3>>24,lane) ^ mb_ror8(mb_pin(Td0p,(s2>>16)&0xff,lane)) ^ mb_ror16(mb_pin(Td0p,(s1>>8)&0xff,lane)) ^ mb_ror24(mb_pin(Td0p,s0&0xff,lane)) ^ dk[4*r+3];
+        s0=t0; s1=t1; s2=t2; s3=t3;
+    }
+}
+
 // First plaintext byte only: top byte of (o0 ^ dk[56]) = IS[s0>>24] ^ (dk[56]>>24). One table
 // lookup — enough to run first_byte_ok before committing to the full final round.
 MB_AES_HD inline uint8_t aes256_decrypt_byte0(const uint32_t dk[60], uint32_t s0, const uint8_t* IS)
@@ -177,6 +211,16 @@ MB_AES_HD inline void aes256_decrypt_tt(const uint32_t dk[60], const uint8_t in[
 {
     uint32_t s0, s1, s2, s3;
     aes256_decrypt_rounds(dk, in, s0, s1, s2, s3, Td0, Td1, Td2, Td3);
+    aes256_decrypt_final(dk, s0, s1, s2, s3, out, IS);
+}
+
+// Full single-block decrypt via the bank-pinned Td0 (survivor 2nd-block path). Bit-identical to
+// aes256_decrypt_tt; only the middle rounds change to the conflict-free pinned gathers.
+MB_AES_HD inline void aes256_decrypt_tt_pin(const uint32_t dk[60], const uint8_t in[16], uint8_t out[16],
+                                            const uint32_t* Td0p, uint32_t lane, const uint8_t* IS)
+{
+    uint32_t s0, s1, s2, s3;
+    aes256_decrypt_rounds_pin(dk, in, s0, s1, s2, s3, Td0p, lane);
     aes256_decrypt_final(dk, s0, s1, s2, s3, out, IS);
 }
 

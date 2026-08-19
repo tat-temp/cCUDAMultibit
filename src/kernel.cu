@@ -61,6 +61,23 @@ __device__ DevResult d_res;
 __launch_bounds__(MB_THREADS, MB_MINBLOCKS)
 __global__ void crack_kernel(uint64_t base_begin, uint64_t base_count)
 {
+#if defined(MB_BANK_PIN)
+    // Bank-pinned Td0: a 32-wide column-major replica (entry v at [v*32 + lane]) so every warp lane
+    // hits its own bank -> conflict-free (R=1.0) decrypt gathers. Td1..3 come from register rotates.
+    // 32 KB + IMC0..3 (4 KB) + sboxes (0.5 KB) = ~36 KB static shared (under the 48 KB cap).
+    __shared__ uint32_t sTd0p[256*32];
+    __shared__ uint32_t sIMC0[256], sIMC1[256], sIMC2[256], sIMC3[256];
+    __shared__ uint8_t  sS[256], sIS[256];
+    for (int idx = threadIdx.x; idx < 256*32; idx += blockDim.x) sTd0p[idx] = g_Td0[idx >> 5];  // replicate 32-wide
+    for (int i = threadIdx.x; i < 256; i += blockDim.x) {
+        sIMC0[i]=g_IMC0[i]; sIMC1[i]=g_IMC1[i]; sIMC2[i]=g_IMC2[i]; sIMC3[i]=g_IMC3[i];
+        sS[i]=g_sbox[i];  sIS[i]=g_isbox[i];
+    }
+    __syncthreads();
+
+    AesShared tb; tb.Td0=sTd0p; tb.Td1=sTd0p; tb.Td2=sTd0p; tb.Td3=sTd0p;   // Td1..3 unused (rotated from Td0)
+    tb.IMC0=sIMC0; tb.IMC1=sIMC1; tb.IMC2=sIMC2; tb.IMC3=sIMC3; tb.sbox=sS; tb.isbox=sIS;
+#else
     __shared__ uint32_t sTd0[256], sTd1[256], sTd2[256], sTd3[256];
     __shared__ uint32_t sIMC0[256], sIMC1[256], sIMC2[256], sIMC3[256];   // P1
     __shared__ uint8_t  sS[256], sIS[256];
@@ -73,6 +90,7 @@ __global__ void crack_kernel(uint64_t base_begin, uint64_t base_count)
 
     AesShared tb; tb.Td0=sTd0; tb.Td1=sTd1; tb.Td2=sTd2; tb.Td3=sTd3;
     tb.IMC0=sIMC0; tb.IMC1=sIMC1; tb.IMC2=sIMC2; tb.IMC3=sIMC3; tb.sbox=sS; tb.isbox=sIS;
+#endif
 
 #ifdef MB_FIXED_LEN
     constexpr int  L  = MB_FIXED_LEN;   // P2: compile-time length -> d_md5 message words + their adds constant-fold
@@ -111,7 +129,7 @@ __global__ void crack_kernel(uint64_t base_begin, uint64_t base_count)
             uint8_t d1[16];
             d_md5_compress(M1, d1);              // key1
 
-            int k = dev_finish_from_key1(d1, c_salt, c_data, pw, L, tb);
+            int k = dev_finish_from_key1(d1, c_salt, c_data, pw, L, tb, threadIdx.x & 31u);
             if (k) {
                 const uint64_t idx = base * (uint64_t)n0 + c0;
                 if (atomicCAS(&d_res.found, 0, 1) == 0) {

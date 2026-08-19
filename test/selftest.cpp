@@ -124,6 +124,46 @@ int main() {
         else printf("[ ok ] P1 IMC tables == Tdk[sbox[b]] (256/256)\n");
     }
 
+    // ---- 5c. Bank-pinned Td0 decrypt == standard 4-table decrypt (every lane column) ----
+    // A 32-wide column-major Td0 replica (entry v at [v*32+lane]) + register rotates (Td_j=ror(Td0,8j))
+    // must reproduce the 4-table decrypt for EVERY lane 0..31. This is the correctness proof behind the
+    // conflict-free MB_BANK_PIN kernel path; the device gets R=1.0 from the layout, the values are these.
+    {
+        AesTd tb; aes_build_tables(tb);
+        static uint32_t Td0p[256*32];
+        for (int v = 0; v < 256; v++) for (int j = 0; j < 32; j++) Td0p[v*32 + j] = tb.Td0[v];
+        uint32_t seed = 0x9E3779B9u;
+        auto rnd = [&](){ seed = seed*1664525u + 1013904223u; return seed; };
+        int mism = 0;
+        for (int trial = 0; trial < 20000; trial++) {
+            uint8_t key[32], ct[16];
+            for (int i = 0; i < 32; i++) key[i] = (uint8_t)(rnd() >> 24);
+            for (int i = 0; i < 16; i++) ct[i]  = (uint8_t)(rnd() >> 24);
+            uint32_t dk[60];
+            aes256_expand_dec(key, dk, tb.sbox, tb.IMC0, tb.IMC1, tb.IMC2, tb.IMC3);
+            uint32_t r0,r1,r2,r3; aes256_decrypt_rounds(dk, ct, r0,r1,r2,r3, tb.Td0,tb.Td1,tb.Td2,tb.Td3);
+            uint32_t lane = rnd() & 31u;
+            uint32_t p0,p1,p2,p3; aes256_decrypt_rounds_pin(dk, ct, p0,p1,p2,p3, Td0p, lane);
+            if (p0!=r0 || p1!=r1 || p2!=r2 || p3!=r3) mism++;
+            uint8_t g0[16], g1[16];
+            aes256_decrypt_tt(dk, ct, g0, tb.Td0,tb.Td1,tb.Td2,tb.Td3, tb.isbox);
+            aes256_decrypt_tt_pin(dk, ct, g1, Td0p, lane, tb.isbox);
+            if (memcmp(g0,g1,16) != 0) mism++;
+        }
+        // sweep all 32 columns on one fixed vector (every lane must give the identical plaintext)
+        uint8_t key[32], ct[16];
+        for (int i = 0; i < 32; i++) key[i] = (uint8_t)(3*i+1);
+        for (int i = 0; i < 16; i++) ct[i]  = (uint8_t)(5*i+2);
+        uint32_t dk[60]; aes256_expand_dec(key, dk, tb.sbox, tb.IMC0,tb.IMC1,tb.IMC2,tb.IMC3);
+        uint8_t ref[16]; aes256_decrypt_tt(dk, ct, ref, tb.Td0,tb.Td1,tb.Td2,tb.Td3, tb.isbox);
+        for (uint32_t lane = 0; lane < 32; lane++) {
+            uint8_t got[16]; aes256_decrypt_tt_pin(dk, ct, got, Td0p, lane, tb.isbox);
+            if (memcmp(ref, got, 16) != 0) mism++;
+        }
+        if (mism) { printf("[FAIL] bank-pinned Td0 decrypt != reference (%d)\n", mism); failures++; }
+        else printf("[ ok ] bank-pinned Td0 (conflict-free decrypt) == reference (20000 vectors + 32-col sweep)\n");
+    }
+
     // ---- 6. Word-oriented MD5 message assembly == reference MD5, every length & shape ----
     // Step 2 removed the uint8_t msg[64] byte buffer; d_md5(a,la,b,lb,c,lc) must still equal
     // md5(a||b||c) for EVERY length the KDF can produce. The risk is the salt tail's placement

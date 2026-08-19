@@ -1,0 +1,3 @@
+# Shell scripts must stay LF so they run on the Linux build/benchmark box
+# regardless of the Windows checkout's autocrlf setting.
+*.sh text eol=lf

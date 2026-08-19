@@ -2,7 +2,9 @@
 #
 #   make            # GPU build (default) -> ./mbcrack + ./mbcrack_l7..l15  (10 binaries) [CUDA >= 12.8]
 #   make runtime    # just the length-agnostic ./mbcrack (skip the 9 fixed-length binaries)
-#   make mbcrack_l8 # a single fixed-length binary (P2: pw_len baked in at compile time)
+#   make mbcrack_l8 # a single fixed-length production binary (pin-Td0 + 2 blocks/SM, pw_len baked in)
+#   make baseline   # unpinned 1-block A/B reference: ./mbcrack_base_l7..l15
+#   make mbpin      # MultiBit-only fast build: ./mbcrack_mbpin_l7..l15 (+22%, detects MultiBit only)
 #   make cpu        # CPU-only build (g++, no CUDA) -> ./mbcrack_cpu + ./selftest
 #   make test       # build + run the CPU self-test (no GPU needed)
 #   make gate       # native-arch build with -Xptxas -v; FAIL on spill or reg-ceiling breach
@@ -11,22 +13,33 @@
 #   make resusage   # per-kernel resource usage from the fat binary
 #   make clean
 #
+# The production fixed-length binaries (mbcrack_l7..l15) ship the measured win: bank-pinned Td0
+# (conflict-free R=1.0 decrypt gathers, -DMB_BANK_PIN) + 2 blocks/SM (__launch_bounds__ minBlocks=2).
+# RTX 5090 (sm_120, 2.55 GHz): ~11.75 GH/s, +14.9% vs the unpinned 1-block baseline, 128 reg / 0 spill,
+# all wallet types, bit-identical to hashcat m22500. The length-agnostic runtime `mbcrack` stays at
+# 1 block/SM (173 reg, would spill at 2). See `make baseline` for the A/B reference.
+#
 # RTX 5090 = sm_120 (requires CUDA >= 12.8). On a box without nvidia-smi, pass it explicitly:
 #   make GPU_ARCH=120
 # nvcc's host compiler defaults to g++ on Linux (override: make HOSTCXX=g++-13).
 #
-# Tuning knobs (occupancy vs register spills, see DEVELOPMENT_PLAN.md matrix):
-#   make MINBLOCKS=1|2|3     # __launch_bounds__ minBlocksPerMP; default 1. `make gate` tracks the ceiling.
-#   make THREADS=256|512     # block size; 512 = hashcat's config (forces 128-reg cap -> spills).
-#   A/B on-device:  make clean && make THREADS=512 && ./mbcrack --benchmark   (clean: obj is cached)
+# Tuning knobs:
+#   make MINBLOCKS=1|2       # __launch_bounds__ minBlocksPerMP for the runtime + baseline/gate builds.
+#   make THREADS=256|512     # block size; 512 = hashcat's config (forces the 128-reg cap -> spills).
 
 TARGET      := mbcrack
-# P2: fixed-length GPU binaries — one executable per compile-time password length (7..15). Each
-# mbcrack_l<N> bakes -DMB_FIXED_LEN=<N> so the MD5 KDF message words constant-fold for that length.
-# The runtime `mbcrack` above handles any length (use it for 1..6); together = 10 executables.
 FIXED_LENS    := 7 8 9 10 11 12 13 14 15
+# Production fixed-length binaries: bank-pinned Td0 + 2 blocks/SM (see header). `make` builds these.
 FIXED_TARGETS := $(addprefix mbcrack_l,$(FIXED_LENS))
 FIXED_OBJS    := $(foreach L,$(FIXED_LENS),main_l$(L).o kernel_l$(L).o)
+# Unpinned single-block baseline (mbcrack_base_l7..l15) — the A/B reference for the pin+occupancy win.
+BASE_TARGETS  := $(addprefix mbcrack_base_l,$(FIXED_LENS))
+BASE_OBJS     := $(foreach L,$(FIXED_LENS),main_base_l$(L).o kernel_base_l$(L).o)
+# MultiBit-only fast build (mbcrack_mbpin_l7..l15): -DMB_WALLET_MULTIBIT drops the bitcoinj/KnC survivor
+# branches -> 127 reg, so pin-Td0 reaches 2 blocks/SM at the DEFAULT minBlocks=1 (127*256*2 < 65536) with
+# better codegen than a forced minBlocks=2. Measured ~12.48 GH/s (+22%). Detects MultiBit Classic only.
+MBPIN_TARGETS := $(addprefix mbcrack_mbpin_l,$(FIXED_LENS))
+MBPIN_OBJS    := $(foreach L,$(FIXED_LENS),main_mbpin_l$(L).o kernel_mbpin_l$(L).o)
 CPU_TARGET  := mbcrack_cpu
 SRC_HOST    := src/main.cpp
 SRC_DEV     := src/kernel.cu
@@ -55,14 +68,14 @@ SM_ARCHS   := $(strip $(BASE_ARCHS) $(filter-out $(BASE_ARCHS),$(GPU_ARCH)))
 GENCODE    := $(foreach a,$(SM_ARCHS),-gencode arch=compute_$(a),code=sm_$(a))
 NATIVE_GENCODE := -gencode arch=compute_$(GPU_ARCH),code=sm_$(GPU_ARCH)
 
-# __launch_bounds__(THREADS, MINBLOCKS) — the occupancy/register knobs (see the tuning matrix in
-# DEVELOPMENT_PLAN.md). MINBLOCKS 1 = default (no spills, fastest on RTX 5090), 2/3 = more occupancy but
-# spills. THREADS = block size (256 default; 512 matches hashcat's config but forces the 128-reg cap ->
-# spills). Changing either needs a rebuild: make clean && make THREADS=512 && ./mbcrack --benchmark
+# __launch_bounds__(THREADS, MINBLOCKS). MB_MINBLOCKS is injected PER BUILD (not baked into the shared
+# flags): the production fixed-length rules hardcode 2, the MultiBit champion hardcodes 1, and the
+# runtime + baseline + gate builds use $(MINBLOCKS) below. THREADS = block size (256 default).
 MINBLOCKS  ?= 1
 THREADS    ?= 256
 
-NVCC_FLAGS := -O3 -use_fast_math --ptxas-options=-O3 $(GENCODE) -DUSE_CUDA -DMB_MINBLOCKS=$(MINBLOCKS) -DMB_THREADS=$(THREADS) -Isrc
+NVCC_FLAGS := -O3 -use_fast_math --ptxas-options=-O3 $(GENCODE) -DUSE_CUDA -DMB_THREADS=$(THREADS) -Isrc
+MB_OCC     := -DMB_MINBLOCKS=$(MINBLOCKS)      # runtime + baseline A/B; production targets set their own
 CXXFLAGS   := -std=c++17 -Xcompiler -pthread -ccbin $(HOSTCXX)
 LDFLAGS    := -cudart=static -Xcompiler -pthread
 
@@ -70,7 +83,7 @@ LDFLAGS    := -cudart=static -Xcompiler -pthread
 CPUCXX      ?= g++
 CPUFLAGS    := -O3 -std=c++17 -Isrc -pthread
 
-.PHONY: all runtime cpu test gate ptxinfo sass resusage tools clean
+.PHONY: all runtime baseline mbpin cpu test gate ptxinfo sass resusage tools clean
 
 # Default goal is the GPU cracker. Set explicitly so it can't be hijacked by target
 # ordering (e.g. `tools:` appearing first would otherwise become the default).
@@ -81,26 +94,48 @@ all: $(TARGET) $(FIXED_TARGETS)
 # runtime-only build (just the length-agnostic mbcrack, skip the 9 fixed binaries)
 runtime: $(TARGET)
 
+# unpinned 1-block baseline binaries (mbcrack_base_l7..l15) — the A/B reference for the shipped win.
+baseline: $(BASE_TARGETS)
+
+# MultiBit-only fast build (mbcrack_mbpin_l7..l15).
+mbpin: $(MBPIN_TARGETS)
+
 # keep the per-length objects (pattern-rule intermediates) so rebuilds don't recompile them
-.SECONDARY: $(FIXED_OBJS)
+.SECONDARY: $(FIXED_OBJS) $(BASE_OBJS) $(MBPIN_OBJS)
 
 tools: gen_vector
 
-# --- GPU build: two TUs (host main.cpp + device kernel.cu), no rdc needed ---
+# --- GPU runtime build: two TUs (host main.cpp + device kernel.cu). Length-agnostic; 1 block/SM. ---
 main.o: $(SRC_HOST) $(HDRS)
-	$(NVCC) $(NVCC_FLAGS) $(CXXFLAGS) -c $< -o $@
+	$(NVCC) $(NVCC_FLAGS) $(MB_OCC) $(CXXFLAGS) -c $< -o $@
 kernel.o: $(SRC_DEV) $(HDRS)
-	$(NVCC) $(NVCC_FLAGS) $(CXXFLAGS) -c $< -o $@
+	$(NVCC) $(NVCC_FLAGS) $(MB_OCC) $(CXXFLAGS) -c $< -o $@
 $(TARGET): main.o kernel.o
 	$(NVCC) $(NVCC_FLAGS) $(CXXFLAGS) main.o kernel.o -o $@ $(LDFLAGS)
 
-# --- fixed-length GPU builds (P2): mbcrack_l<N> = both TUs compiled with -DMB_FIXED_LEN=<N>.
-# $* is the length stem, so `make mbcrack_l8` bakes MB_FIXED_LEN=8 into main + kernel. ---
+# --- PRODUCTION fixed-length builds: pin-Td0 (-DMB_BANK_PIN) + 2 blocks/SM (-DMB_MINBLOCKS=2).
+# $* is the length stem, so `make mbcrack_l8` bakes MB_FIXED_LEN=8 (MD5 KDF words constant-fold). ---
 main_l%.o: $(SRC_HOST) $(HDRS)
-	$(NVCC) $(NVCC_FLAGS) -DMB_FIXED_LEN=$* $(CXXFLAGS) -c $(SRC_HOST) -o $@
+	$(NVCC) $(NVCC_FLAGS) -DMB_MINBLOCKS=2 -DMB_BANK_PIN -DMB_FIXED_LEN=$* $(CXXFLAGS) -c $(SRC_HOST) -o $@
 kernel_l%.o: $(SRC_DEV) $(HDRS)
-	$(NVCC) $(NVCC_FLAGS) -DMB_FIXED_LEN=$* $(CXXFLAGS) -c $(SRC_DEV) -o $@
+	$(NVCC) $(NVCC_FLAGS) -DMB_MINBLOCKS=2 -DMB_BANK_PIN -DMB_FIXED_LEN=$* $(CXXFLAGS) -c $(SRC_DEV) -o $@
 mbcrack_l%: main_l%.o kernel_l%.o
+	$(NVCC) $(NVCC_FLAGS) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
+
+# --- unpinned baseline (A/B reference): no pin, minBlocks=$(MINBLOCKS) (default 1). ---
+main_base_l%.o: $(SRC_HOST) $(HDRS)
+	$(NVCC) $(NVCC_FLAGS) $(MB_OCC) -DMB_FIXED_LEN=$* $(CXXFLAGS) -c $(SRC_HOST) -o $@
+kernel_base_l%.o: $(SRC_DEV) $(HDRS)
+	$(NVCC) $(NVCC_FLAGS) $(MB_OCC) -DMB_FIXED_LEN=$* $(CXXFLAGS) -c $(SRC_DEV) -o $@
+mbcrack_base_l%: main_base_l%.o kernel_base_l%.o
+	$(NVCC) $(NVCC_FLAGS) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
+
+# --- MultiBit-only fast build: -DMB_WALLET_MULTIBIT -DMB_BANK_PIN, minBlocks=1 (127 reg -> 2 blocks). ---
+main_mbpin_l%.o: $(SRC_HOST) $(HDRS)
+	$(NVCC) $(NVCC_FLAGS) -DMB_MINBLOCKS=1 -DMB_WALLET_MULTIBIT -DMB_BANK_PIN -DMB_FIXED_LEN=$* $(CXXFLAGS) -c $(SRC_HOST) -o $@
+kernel_mbpin_l%.o: $(SRC_DEV) $(HDRS)
+	$(NVCC) $(NVCC_FLAGS) -DMB_MINBLOCKS=1 -DMB_WALLET_MULTIBIT -DMB_BANK_PIN -DMB_FIXED_LEN=$* $(CXXFLAGS) -c $(SRC_DEV) -o $@
+mbcrack_mbpin_l%: main_mbpin_l%.o kernel_mbpin_l%.o
 	$(NVCC) $(NVCC_FLAGS) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
 
 # --- CPU-only build (works with no CUDA installed) ---
@@ -119,10 +154,11 @@ test: selftest gen_vector
 HOT_KERNEL  := crack_kernel
 REG_CEILING := $(shell echo $$((65536 / ($(THREADS) * $(MINBLOCKS)))))   # tracks THREADS and MINBLOCKS
 GATE_LOG    := ptxas-gate.log
-# Pass FIXED_LEN=N to gate/ptxinfo a specific fixed-length kernel, e.g. `make gate FIXED_LEN=8`.
+# Gate a specific config, e.g. the production kernel: `make gate FIXED_LEN=8 BANK_PIN=1 MINBLOCKS=2`.
 PTXAS_V_BUILD = $(NVCC) -O3 -use_fast_math --ptxas-options=-O3 $(NATIVE_GENCODE) $(CXXFLAGS) \
                 -DUSE_CUDA -DMB_MINBLOCKS=$(MINBLOCKS) -DMB_THREADS=$(THREADS) \
-                $(if $(FIXED_LEN),-DMB_FIXED_LEN=$(FIXED_LEN)) -Isrc \
+                $(if $(FIXED_LEN),-DMB_FIXED_LEN=$(FIXED_LEN)) \
+                $(if $(BANK_PIN),-DMB_BANK_PIN) $(if $(WALLET_MB),-DMB_WALLET_MULTIBIT) -Isrc \
                 -Xptxas -v -c $(SRC_DEV) -o kernel-ptxinfo.o
 
 ptxinfo: $(SRC_DEV) $(HDRS)
@@ -157,4 +193,6 @@ sass: $(TARGET)
 	cuobjdump -sass $(TARGET)
 
 clean:
-	rm -f $(TARGET) $(FIXED_TARGETS) $(CPU_TARGET) selftest gen_vector main.o kernel.o main_l*.o kernel_l*.o kernel-ptxinfo.o $(GATE_LOG)
+	rm -f $(TARGET) $(FIXED_TARGETS) $(BASE_TARGETS) $(MBPIN_TARGETS) $(CPU_TARGET) selftest gen_vector \
+	      main.o kernel.o main_l*.o kernel_l*.o main_base_l*.o kernel_base_l*.o main_mbpin_l*.o kernel_mbpin_l*.o \
+	      kernel-ptxinfo.o $(GATE_LOG)

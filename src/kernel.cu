@@ -32,7 +32,7 @@ namespace mb {
 #endif                                 // default 1: measured fastest on RTX 5090 (register/spill-bound)
 
 // P2 (optional): -DMB_FIXED_LEN=N bakes the password length in at compile time so the MD5 KDF
-// message assembly constant-folds (mbcrack_l7..l15 binaries). Absent => runtime length (default).
+// message assembly constant-folds (mbcrack_l7..l16 binaries). Absent => runtime length (default).
 #ifdef MB_FIXED_LEN
   #if (MB_FIXED_LEN) < 1 || (MB_FIXED_LEN) > MB_MAX_LEN
     #error "MB_FIXED_LEN must be in [1, MB_MAX_LEN]"

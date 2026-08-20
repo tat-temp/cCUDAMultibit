@@ -1,10 +1,10 @@
 # Makefile — mbcrack (MultiBit m22500 CUDA cracker), Ubuntu/Linux.
 #
-#   make            # GPU build (default) -> ./mbcrack + ./mbcrack_l7..l15  (10 binaries) [CUDA >= 12.8]
-#   make runtime    # just the length-agnostic ./mbcrack (skip the 9 fixed-length binaries)
+#   make            # GPU build (default) -> ./mbcrack + ./mbcrack_l7..l16  (11 binaries) [CUDA >= 12.8]
+#   make runtime    # just the length-agnostic ./mbcrack (skip the 10 fixed-length binaries)
 #   make mbcrack_l8 # a single fixed-length production binary (pin-Td0 + 2 blocks/SM, pw_len baked in)
-#   make baseline   # unpinned 1-block A/B reference: ./mbcrack_base_l7..l15
-#   make mbpin      # MultiBit-only fast build: ./mbcrack_mbpin_l7..l15 (+22%, detects MultiBit only)
+#   make baseline   # unpinned 1-block A/B reference: ./mbcrack_base_l7..l16
+#   make mbpin      # MultiBit-only fast build: ./mbcrack_mbpin_l7..l16 (+22%, detects MultiBit only)
 #   make cpu        # CPU-only build (g++, no CUDA) -> ./mbcrack_cpu + ./selftest
 #   make test       # build + run the CPU self-test (no GPU needed)
 #   make gate       # native-arch build with -Xptxas -v; FAIL on spill or reg-ceiling breach
@@ -13,7 +13,7 @@
 #   make resusage   # per-kernel resource usage from the fat binary
 #   make clean
 #
-# The production fixed-length binaries (mbcrack_l7..l15) ship the measured win: bank-pinned Td0
+# The production fixed-length binaries (mbcrack_l7..l16) ship the measured win: bank-pinned Td0
 # (conflict-free R=1.0 decrypt gathers, -DMB_BANK_PIN) + 2 blocks/SM (__launch_bounds__ minBlocks=2).
 # RTX 5090 (sm_120, 2.55 GHz): ~11.75 GH/s, +14.9% vs the unpinned 1-block baseline, 128 reg / 0 spill,
 # all wallet types, bit-identical to hashcat m22500. The length-agnostic runtime `mbcrack` stays at
@@ -28,14 +28,14 @@
 #   make THREADS=256|512     # block size; 512 = hashcat's config (forces the 128-reg cap -> spills).
 
 TARGET      := mbcrack
-FIXED_LENS    := 7 8 9 10 11 12 13 14 15
+FIXED_LENS    := 7 8 9 10 11 12 13 14 15 16
 # Production fixed-length binaries: bank-pinned Td0 + 2 blocks/SM (see header). `make` builds these.
 FIXED_TARGETS := $(addprefix mbcrack_l,$(FIXED_LENS))
 FIXED_OBJS    := $(foreach L,$(FIXED_LENS),main_l$(L).o kernel_l$(L).o)
-# Unpinned single-block baseline (mbcrack_base_l7..l15) — the A/B reference for the pin+occupancy win.
+# Unpinned single-block baseline (mbcrack_base_l7..l16) — the A/B reference for the pin+occupancy win.
 BASE_TARGETS  := $(addprefix mbcrack_base_l,$(FIXED_LENS))
 BASE_OBJS     := $(foreach L,$(FIXED_LENS),main_base_l$(L).o kernel_base_l$(L).o)
-# MultiBit-only fast build (mbcrack_mbpin_l7..l15): -DMB_WALLET_MULTIBIT drops the bitcoinj/KnC survivor
+# MultiBit-only fast build (mbcrack_mbpin_l7..l16): -DMB_WALLET_MULTIBIT drops the bitcoinj/KnC survivor
 # branches -> 127 reg, so pin-Td0 reaches 2 blocks/SM at the DEFAULT minBlocks=1 (127*256*2 < 65536) with
 # better codegen than a forced minBlocks=2. Measured ~12.48 GH/s (+22%). Detects MultiBit Classic only.
 MBPIN_TARGETS := $(addprefix mbcrack_mbpin_l,$(FIXED_LENS))
@@ -91,13 +91,13 @@ CPUFLAGS    := -O3 -std=c++17 -Isrc -pthread
 
 all: $(TARGET) $(FIXED_TARGETS)
 
-# runtime-only build (just the length-agnostic mbcrack, skip the 9 fixed binaries)
+# runtime-only build (just the length-agnostic mbcrack, skip the 10 fixed binaries)
 runtime: $(TARGET)
 
-# unpinned 1-block baseline binaries (mbcrack_base_l7..l15) — the A/B reference for the shipped win.
+# unpinned 1-block baseline binaries (mbcrack_base_l7..l16) — the A/B reference for the shipped win.
 baseline: $(BASE_TARGETS)
 
-# MultiBit-only fast build (mbcrack_mbpin_l7..l15).
+# MultiBit-only fast build (mbcrack_mbpin_l7..l16).
 mbpin: $(MBPIN_TARGETS)
 
 # keep the per-length objects (pattern-rule intermediates) so rebuilds don't recompile them
